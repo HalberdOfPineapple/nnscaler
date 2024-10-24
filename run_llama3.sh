@@ -4,7 +4,8 @@
 cd $NNSCALER_HOME/examples/llama3_8B_128K
 
 # Create logs directory if it doesn't exist
-mkdir -p /blob/logs/nnscaler/llama_8B_128K_cuda_4
+# if $WORLD_SIZE == 1, set the folder without number of GPUs
+mkdir -p /blob/logs/nnscaler/llama3_8B_128K_cuda_$WORLD_SIZE
 
 # # Execute the first command and redirect output to the data preparation log
 # echo "Running data preparation..."
