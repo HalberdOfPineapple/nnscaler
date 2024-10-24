@@ -200,8 +200,14 @@ def main(args):
         },
     )
 
+    # checkpoint_config = CheckpointConfig(
+    #     # every_n_train_steps=1000,
+    #     every_n_train_steps=5000,
+    #     save_type='deduped',
+    #     resume_from=(args.resume_path or 'last'),
+    # )
     checkpoint_config = CheckpointConfig(
-        every_n_train_steps=1000,
+        every_n_epochs=1,
         save_type='deduped',
         resume_from=(args.resume_path or 'last'),
     )
