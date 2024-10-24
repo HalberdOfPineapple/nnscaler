@@ -231,6 +231,7 @@ def main(args):
         seed=0,
         broadcast_strategy=broadcast_strategy,
         dataset_sampler=sampler_config,
+        enable_progress_bar=not args.disable_progressbar,
     )
 
     trainer = Trainer(train_args=trainer_args)
@@ -281,6 +282,12 @@ if __name__ == '__main__':
         '--model_id',
         default=None,
         type=str,
+        help='transformers model id',
+    )
+    parser.add_argument(
+        '-p'
+        '--disable_progressbar',
+        action='store_true',
         help='transformers model id',
     )
     args = parser.parse_args()
