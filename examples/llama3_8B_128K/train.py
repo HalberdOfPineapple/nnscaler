@@ -285,7 +285,7 @@ if __name__ == '__main__':
         help='transformers model id',
     )
     parser.add_argument(
-        '-p'
+        '-p',
         '--disable_progressbar',
         action='store_true',
         help='transformers model id',
