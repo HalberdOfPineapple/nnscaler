@@ -116,7 +116,10 @@ def main(args):
 
     if args.attn_type == 'custom':
         logger.info('Using custom attention for gradient experiment')   
-    nnscaler_llama_init(attn_type=args.attn_type)
+    nnscaler_llama_init(
+        attn_type=args.attn_type,
+        attn_save_path=args.attn_save_path,
+    )
 
     ## Setup Dataset ##
     dataset = load_from_disk(args.dataset_path)
@@ -280,7 +283,7 @@ if __name__ == '__main__':
     parser.add_argument('--n_epochs', type=int, default=None, help='Number of epochs')
     parser.add_argument('-a', '--attn_type', type=str, default='custom', help='attention type')
     parser.add_argument('-s', '--save_step', type=int, default=1, help='Save attention data every n steps')
+    parser.add_argument('--attn_save_path', type=str, default=None, help='path to save attention data')
 
     args = parser.parse_args()
-
     main(args)

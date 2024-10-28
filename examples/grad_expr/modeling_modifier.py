@@ -60,11 +60,10 @@ def rmsnorm_fwd(self, hidden_states):
 
 # Asynchronous executor for I/O tasks
 ATTN_DATA_SAVER = concurrent.futures.ThreadPoolExecutor(max_workers=4)  # Adjust `max_workers` as needed
-
+ATTN_SAVE_DIR: str = './attn_data'
 def async_save(arr:np.array, path: str):
     with open(path, 'wb') as f:
         np.save(f, arr)
-        # torch.save(tensor, f)
 
 class CaptureAttention(torch.autograd.Function):
     @staticmethod
@@ -74,28 +73,25 @@ class CaptureAttention(torch.autograd.Function):
         attn_save_path: str,
         grad_save_path: str
     ):
-        with open(attn_save_path, 'wb') as f:
-            # np.save(f, attn_weights.clone().detach().cpu().float().numpy())
-            ATTN_DATA_SAVER.submit(async_save, attn_weights.clone().detach().cpu().float().numpy(), attn_save_path)
-
+        ATTN_DATA_SAVER.submit(async_save, attn_weights.clone().detach().cpu().float().numpy(), attn_save_path)
         ctx.grad_save_path = grad_save_path
+        
         return attn_weights
 
     @staticmethod
     def backward(ctx: torch.autograd.function.FunctionCtx, grad_output: torch.Tensor):
         grad_save_path = ctx.grad_save_path
-        with open(grad_save_path, 'wb') as f:
-            # np.save(f, grad_output.clone().detach().cpu().float().numpy())
-            ATTN_DATA_SAVER.submit(async_save, grad_output.clone().detach().cpu().float().numpy(), grad_save_path)
+        ATTN_DATA_SAVER.submit(async_save, grad_output.clone().detach().cpu().float().numpy(), grad_save_path)
     
         return grad_output, None, None
 
 def get_save_path(layer_idx, rank):
     iter_idx = get_iter_cnt(rank)
-    os.makedirs(f'./attn_data/{iter_idx}/{layer_idx}', exist_ok=True)
+    attn_save_dir = os.path.join(ATTN_SAVE_DIR, str(iter_idx), str(layer_idx))
+    os.makedirs(attn_save_dir, exist_ok=True)
 
-    attn_save_path = f'./attn_data/{iter_idx}/{layer_idx}/attn_{rank}.npy'
-    grad_save_path = f'./attn_data/{iter_idx}/{layer_idx}/grad_{rank}.npy'
+    attn_save_path = os.path.join(attn_save_dir, f'attn_{rank}.npy')
+    grad_save_path = os.path.join(attn_save_dir, f'grad_{rank}.npy')
 
     return attn_save_path, grad_save_path
 
@@ -108,7 +104,6 @@ def capture_attention_forward(attn_weights: torch.Tensor, layer_idx: int) -> tor
         return attn_weights
 
 def capture_attention_anno(attn_weights: torch.Tensor, layer_idx: int) -> str:
-    # [batch_size, num_heads, query_len, query_len]
     return 'b num_heads l^ l^ -> b num_heads l^ l^'
 register_op(capture_attention_anno)(capture_attention_forward)
 
@@ -425,10 +420,11 @@ def llama_flash_attention_anno(query_states, key_states, value_states, attention
 
 register_op(llama_flash_attention_anno)(nnscaler_flash_attention_forward)
 
+def nnscaler_llama_init(attn_type: str='flash', attn_save_path: str=None):
+    if attn_save_path:
+        global ATTN_SAVE_DIR
+        ATTN_SAVE_DIR = attn_save_path
 
-def nnscaler_llama_init(attn_type: str='flash'):
-    # This imports the reference to the original dictionary object (`LLAMA_ATTENTION_CLASSES`) in the module.
-    # The original 
     if attn_type == 'flash':
         LLAMA_ATTENTION_CLASSES["flash_attention_2"] = NNScalerLlamaFlashAttention2
     elif attn_type == 'custom':
@@ -437,79 +433,3 @@ def nnscaler_llama_init(attn_type: str='flash'):
         raise ValueError(f"Invalid attention type {attn_type}")
 
     LlamaRMSNorm.forward = rmsnorm_fwd
-
-
-# ---------------------------------------------------------
-# # Draft:
-# class CustomAttenFunc(torch.autograd.Function):
-#     @staticmethod
-#     def forward(
-#         ctx: torch.autograd.function.FunctionCtx, 
-#         query_states, key_states, value_states, 
-#         attn_mask, attn_dropout, training
-#     ):
-#         # query_states: [batch_size, num_heads, query_len, head_dim]
-#         head_dim = query_states.size(-1)
-
-#         # Compute scaled dot-product attention scores
-#         orig_attn_weights = torch.matmul(query_states, key_states.transpose(-2, -1)) / math.sqrt(head_dim)
-        
-#         # Apply mask if provided
-#         if attn_mask is not None:
-#             causal_mask = attn_mask[:, :, :, :key_states.shape[-2]]
-#             orig_attn_weights = orig_attn_weights + causal_mask
-
-#         # Softmax across the last dimension and apply dropout if in training mode
-#         orig_attn_weights = nn.functional.softmax(orig_attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
-#         attn_weights = nn.functional.dropout(orig_attn_weights, p=attn_dropout, training=training)
-
-#         # Multiply attention weights by value states to get the output
-#         attn_output = torch.matmul(attn_weights, value_states)
-
-#         # Save for backward pass
-#         ctx.save_for_backward(query_states, key_states, value_states, attn_weights, orig_attn_weights, attn_mask)
-#         ctx.attn_dropout = attn_dropout
-#         ctx.training = training
-
-#         return attn_output
-
-#     @staticmethod
-#     def backward(ctx: torch.autograd.function.FunctionCtx, grad_output):
-#         query_states, key_states, value_states, attn_weights, orig_attn_weights, attn_mask = ctx.saved_tensors
-#         attn_dropout = ctx.attn_dropout
-#         training = ctx.training
-
-#         # Compute gradients w.r.t. value states
-#         # attn_weights - [batch_size, num_heads, query_len, query_len]
-#         # grad_output - [batch_size, num_heads, query_len, head_dim]
-#         # grad_value_states - [batch_size, num_heads, query_len, head_dim]
-#         grad_value_states = torch.matmul(attn_weights.transpose(-2, -1), grad_output)
-
-#         # Compute gradients w.r.t. attention weights
-#         # grad_output - [batch_size, num_heads, query_len, head_dim]
-#         # value_states - [batch_size, num_heads, query_len, head_dim]
-#         # grad_attn_weights - [batch_size, num_heads, query_len, query_len]
-#         grad_attn_weights = torch.matmul(grad_output, value_states.transpose(-2, -1))
-
-#         # Directly assume grad w.r.t attn_weights is equivalent to grad w.r.t orig_attn_weights because 
-#         grad_orig_attn_weights = grad_attn_weights
-
-#         # Compute gradients w.r.t. matrix multiplication before softmax
-#         # Because the direct operand of Softmax is the matrix multiplication result before dropout, so we use orig_attn_weights here
-#         grad_orig_attn_mul = grad_orig_attn_weights * orig_attn_weights * (1 - orig_attn_weights)
-
-#         # ------------------------------------------------
-#         # Save the gradients w.r.t (orig)_attn_weights to files
-
-
-#         # -------------------------------------------------
-
-
-#         # Compute gradients w.r.t. query and key states
-#         # grad_orig_attn_mul - [batch_size, num_heads, query_len, query_len]
-#         # key_states - [batch_size, num_heads, query_len, head_dim]
-#         # query_states - [batch_size, num_heads, query_len, head_dim]
-#         grad_query_states = torch.matmul(grad_orig_attn_mul, key_states)
-#         grad_key_states = torch.matmul(grad_attn_weights, query_states)
-
-#         return grad_query_states, grad_key_states, grad_value_states, None, None, None
