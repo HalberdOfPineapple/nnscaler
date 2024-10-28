@@ -41,7 +41,7 @@ if is_flash_attn_2_available():
 
 
 try:
-    from apex.normalization.fused_layer_norm import fused_rms_norm_affine
+    from apex.normalization.fused_layer_norm import fused_rms_norm_affine # type: ignore
     has_apex = True
 except ImportError:
     has_apex = False
