@@ -32,7 +32,7 @@ from transformers.utils import (
     replace_return_docstrings,
 )
 
-from custom_trainer import get_iter_cnt
+from custom_trainer import get_iter_cnt, need_save_data
 
 
 if is_flash_attn_2_available():
@@ -61,9 +61,9 @@ def rmsnorm_fwd(self, hidden_states):
 # Asynchronous executor for I/O tasks
 ATTN_DATA_SAVER = concurrent.futures.ThreadPoolExecutor(max_workers=4)  # Adjust `max_workers` as needed
 
-def async_save(tensor: torch.Tensor, path: str):
+def async_save(arr:np.array, path: str):
     with open(path, 'wb') as f:
-        np.save(f, tensor.cpu().numpy())
+        np.save(f, arr)
         # torch.save(tensor, f)
 
 class CaptureAttention(torch.autograd.Function):
@@ -75,8 +75,8 @@ class CaptureAttention(torch.autograd.Function):
         grad_save_path: str
     ):
         with open(attn_save_path, 'wb') as f:
-            np.save(f, attn_weights.clone().detach().cpu().float().numpy())
-        # ATTN_DATA_SAVER.submit(async_save, attn_weights, attn_save_path)
+            # np.save(f, attn_weights.clone().detach().cpu().float().numpy())
+            ATTN_DATA_SAVER.submit(async_save, attn_weights.clone().detach().cpu().float().numpy(), attn_save_path)
 
         ctx.grad_save_path = grad_save_path
         return attn_weights
@@ -85,9 +85,9 @@ class CaptureAttention(torch.autograd.Function):
     def backward(ctx: torch.autograd.function.FunctionCtx, grad_output: torch.Tensor):
         grad_save_path = ctx.grad_save_path
         with open(grad_save_path, 'wb') as f:
-            np.save(f, grad_output.clone().detach().cpu().float().numpy())
-            # torch.save(grad_output, f)
-        # ATTN_DATA_SAVER.submit(async_save, grad_output.clone().detach(), grad_save_path)
+            # np.save(f, grad_output.clone().detach().cpu().float().numpy())
+            ATTN_DATA_SAVER.submit(async_save, grad_output.clone().detach().cpu().float().numpy(), grad_save_path)
+    
         return grad_output, None, None
 
 def get_save_path(layer_idx, rank):
@@ -101,8 +101,11 @@ def get_save_path(layer_idx, rank):
 
 def capture_attention_forward(attn_weights: torch.Tensor, layer_idx: int) -> torch.Tensor:
     rank = torch.distributed.get_rank()
-    attn_save_path, grad_save_path = get_save_path(layer_idx, rank)
-    return CaptureAttention.apply(attn_weights, attn_save_path, grad_save_path)
+    if need_save_data(rank):
+        attn_save_path, grad_save_path = get_save_path(layer_idx, rank)
+        return CaptureAttention.apply(attn_weights, attn_save_path, grad_save_path)
+    else:
+        return attn_weights
 
 def capture_attention_anno(attn_weights: torch.Tensor, layer_idx: int) -> str:
     # [batch_size, num_heads, query_len, query_len]

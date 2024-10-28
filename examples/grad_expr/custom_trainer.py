@@ -13,7 +13,7 @@ from torch.utils.data import DataLoader
 
 import nnscaler
 import nnscaler.utils
-from nnscaler.cli.trainer import Trainer, _StepStat
+from nnscaler.cli.trainer import Trainer, _StepStat, TrainerArgs
 from nnscaler.utils import enforce_zero_num_worker, is_running_distributed
 
 logger = logging.getLogger(__name__)
@@ -23,7 +23,34 @@ def get_iter_cnt(rank: int):
     global ITERATOR_COUNTER
     return ITERATOR_COUNTER.get(rank, 0)
 
+SAVE_ITERVAL = 1 
+def need_save_data(rank: int ):
+    global SAVE_ITERVAL
+    return get_iter_cnt(rank) % SAVE_ITERVAL == 0
+    
+
 class CustomTrainer(Trainer):
+    def __init__(self,
+                 argv: Optional[List[str]] = None,
+                 *,
+                 train_args: Optional[Union[Dict[str, Any], TrainerArgs]] = None,
+                 save_data_steps: int = 1):
+        """
+        Custom trainer with an additional parameter.
+
+        Args:
+            argv (Optional[List[str]]): Command line arguments. If not specified, sys.argv[1:] will be used.
+            train_args: A dict used to construct TrainerArgs or a TrainerArgs object itself.
+            additional_param (Optional[Any]): Additional parameter for custom functionality.
+        """
+        # Call the parent class's initializer with the existing parameters
+        super().__init__(argv=argv, train_args=train_args)
+        
+        
+        global SAVE_ITERVAL
+        SAVE_ITERVAL = save_data_steps
+        self.save_data_steps = save_data_steps
+
     def _train_epoch(self, epoch):
         VAL_STATUS_NO = 0     # not validated or saved
         VAL_STATUS_VAL = 1    # validated but not saved

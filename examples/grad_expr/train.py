@@ -256,7 +256,10 @@ def main(args):
         dataset_sampler=sampler_config,   
     )
 
-    trainer = Trainer(train_args=trainer_args)
+    trainer = Trainer(
+        train_args=trainer_args,
+        save_data_steps=args.save_step,
+    )
     trainer.run()
 
 
@@ -276,6 +279,7 @@ if __name__ == '__main__':
     parser.add_argument('--n_iter', type=int, default=None, help='Number of iterations')
     parser.add_argument('--n_epochs', type=int, default=None, help='Number of epochs')
     parser.add_argument('-a', '--attn_type', type=str, default='custom', help='attention type')
+    parser.add_argument('-s', '--save_step', type=int, default=1, help='Save attention data every n steps')
 
     args = parser.parse_args()
 
