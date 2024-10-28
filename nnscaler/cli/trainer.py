@@ -40,7 +40,6 @@ CHECKPOINT_BEST_DIR_NAME: str = 'best'
 CHECKPOINT_LAST_FILE_FORMAT: str = 'last/{rank}.ckpt'
 CHECKPOINT_BEST_FILE_FORMAT: str = 'best/{rank}.ckpt'
 
-
 @dataclass
 class TrainStatus:
     best_loss = float('inf')

@@ -11,9 +11,9 @@ import torch
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer, DataCollatorForLanguageModeling
 from modeling_modifier import nnscaler_llama_init
 from chunk_linear_cross_entropy import chunk_linear_cross_entropy
+from custom_trainer import CustomTrainer as Trainer # from nnscaler.cli.trainer import Trainer
 
 from nnscaler.utils import set_default_logger_level
-from nnscaler.cli.trainer import Trainer
 from nnscaler.cli.trainer_args import (
     CheckpointConfig,
     DatasetConfig,
@@ -30,6 +30,8 @@ from nnscaler.parallel import ComputeConfig, BroadcastGenFilesStrategy
 from nnscaler.runtime.f16_optimizer import MixedPrecisionAdamW
 from nnscaler.cli.loggers.tensorboard import TensorBoardLogger
 
+import logging
+logger = logging.getLogger(__name__)
 
 IGNORE_IDX = -100
 
@@ -59,9 +61,14 @@ def get_tokenizer(tokenizer_name_or_path,
 
 
 class WrapperModel(torch.nn.Module):
-    def __init__(self, model_id):
+    def __init__(self, model_id, attn_type: str='custom'):
         super().__init__()
-        self.model = AutoModelForCausalLM.from_pretrained(model_id, attn_implementation='flash_attention_2')
+        self.model = AutoModelForCausalLM.from_pretrained(
+            model_id, 
+            attn_implementation='flash_attention_2' if attn_type != 'custom' else 'eager'
+        )
+        self.attn_type = attn_type
+        self.iter_idx = 0
 
     def forward(self, samples):
         outputs = self.model.model(
@@ -72,6 +79,7 @@ class WrapperModel(torch.nn.Module):
         hidden_states = outputs[0]
         losses = chunk_linear_cross_entropy(hidden_states, self.model.lm_head.weight, samples['target'], IGNORE_IDX, 1024)
         loss = torch.sum(losses)
+
         return loss, loss.data, samples['ntokens'], samples['nsentences']
 
 
@@ -106,7 +114,9 @@ def main(args):
 
     set_default_logger_level('INFO')
 
-    nnscaler_llama_init()
+    if args.attn_type == 'custom':
+        logger.info('Using custom attention for gradient experiment')   
+    nnscaler_llama_init(attn_type=args.attn_type)
 
     ## Setup Dataset ##
     dataset = load_from_disk(args.dataset_path)
@@ -170,6 +180,7 @@ def main(args):
         type=WrapperModel,
         args={
             'model_id': args.model_id,
+            'attn_type': args.attn_type,
         },
     )
 
@@ -222,23 +233,27 @@ def main(args):
     )
 
     trainer_args = TrainerArgs(
+        pas_policy='autodist',
+        precision='bf16',
+        grad_accumulation_steps=4,
+        seed=0,
+
         instance_name=args.name,
         run_mode=args.run_mode,
+        max_epochs=args.n_epochs,
+        max_train_steps=args.n_iter,
+        enable_progress_bar=not args.disable_progressbar,
+        
         compute_config=compute_config,
-        pas_policy='autodist',
         model=model_config,
         optimizer=optimizer_config,
         dataset=dataset_config,
         dataloader=dataloader_config,
         checkpoint=checkpoint_config,
-        precision='bf16',
-        max_epochs=2,
-        grad_accumulation_steps=4,
         log=[log_config],
-        seed=0,
+        
         broadcast_strategy=broadcast_strategy,
-        dataset_sampler=sampler_config,
-        enable_progress_bar=not args.disable_progressbar,
+        dataset_sampler=sampler_config,   
     )
 
     trainer = Trainer(train_args=trainer_args)
@@ -247,56 +262,21 @@ def main(args):
 
 if __name__ == '__main__':
     ## Parse Args ##
-
     parser = argparse.ArgumentParser()
-    parser.add_argument(
-        '--name',
-        default='llama3-8b',
-        type=str,
-        help='name of the experiment',
-    )
-    parser.add_argument(
-        '--run_mode',
-        default='run',
-        choices=['run', 'compile'],
-        help='run or compile',
-    )
-    parser.add_argument(
-        '--plan_ngpus',
-        type=int,
-        required=True,
-        help='specify the scale unit size',
-    )
-    parser.add_argument(
-        '--runtime_ngpus',
-        type=int,
-        required=True,
-        help='specify the number of GPUs to use',
-    )
-    parser.add_argument(
-        '--resume_path',
-        default=None,
-        type=str,
-        help='path to dir of ckpts or the ckpt file to resume from',
-    )
-    parser.add_argument(
-        '--dataset_path',
-        default=None,
-        type=str,
-        help='path to the dataset',
-    )
-    parser.add_argument(
-        '--model_id',
-        default=None,
-        type=str,
-        help='transformers model id',
-    )
-    parser.add_argument(
-        '-p',
-        '--disable_progressbar',
-        action='store_true',
-        help='transformers model id',
-    )
+    
+    parser.add_argument('--name', type=str, default='llama3-8b', help='name of the experiment')
+    parser.add_argument('--run_mode', type=str, default='run', choices=['run', 'compile'], help='run or compile')
+    parser.add_argument('--plan_ngpus', type=int, required=True, help='specify the scale unit size')
+    parser.add_argument('--runtime_ngpus', type=int, required=True, help='specify the number of GPUs to use')
+    parser.add_argument('--resume_path', type=str, default=None, help='path to dir of ckpts or the ckpt file to resume from')
+    parser.add_argument('--dataset_path', type=str, default=None, help='path to the dataset')
+    parser.add_argument('--model_id', type=str, default='microsoft/llama-gpt3-8b', help='transformers model id')
+    parser.add_argument('-p', '--disable_progressbar',action='store_true',help='transformers model id',)
+
+    parser.add_argument('--n_iter', type=int, default=None, help='Number of iterations')
+    parser.add_argument('--n_epochs', type=int, default=None, help='Number of epochs')
+    parser.add_argument('-a', '--attn_type', type=str, default='custom', help='attention type')
+
     args = parser.parse_args()
 
     main(args)

@@ -443,9 +443,12 @@ class RegenStatus(Enum):
     ALL = 'all'     # everything is regenerated, including graph and code
     CODE = 'code'   # only code is regenerated.
 
-
+# The functionality of _prepare_namespace:
+# 1. Add the generated directory to sys.path.
+# 2. Prepare the namespace for the generated module.
+# 3. Prepare the output directory for the generated code.
 def _prepare_namespace(
-        gen_savedir: str,
+        gen_savedir: str, # ./.nnscaler
         module_or_module_class: Union[Type[torch.nn.Module], torch.nn.Module],
         instance_name: Optional[str] = None,
 ) -> Tuple[str, Path]:
@@ -744,7 +747,8 @@ def _gencode(
 
         graph, forward_args = _gen_graph(
             module, dummy_forward_args, outdir,
-            constant_folding=compute_config.constant_folding, end2end_mode=compute_config.use_end2end,
+            constant_folding=compute_config.constant_folding, 
+            end2end_mode=compute_config.use_end2end,
             inference_only=compute_config.inference_only,
         )
         graph.dump(graph_ckp)
@@ -802,6 +806,7 @@ def _gencode(
     sgener = None
     if compute_config.use_end2end:
         sgener = ScheduleCodeGen(execplan, compute_config.runtime_ngpus)
+        
     for rank in range(compute_config.runtime_ngpus):
         fname = outdir / _GENCODE_FILE_TEMPLATE.format(rank)
         mgener.gen(rank,
@@ -848,9 +853,13 @@ def _load_parallel_module_class(
     """
     rank = torch.distributed.get_rank() if rank is None else rank
     namespace, _ = _prepare_namespace(gen_savedir, module_class, instance_name)
+
+    
     gen_imported = importlib.import_module(
         f'{namespace}.{Path(_GENCODE_FILE_TEMPLATE.format(rank)).stem}'
     )
+    # example of gen_imported: <module 'nnscaler.runtime.module.gencode0' from '.../nnscaler/runtime/module/gencode0.py'>
+
     parallel_module_class = gen_imported.GenModel
     # rewrite class name and module name
     parallel_module_class.__name__ = module_class.__name__

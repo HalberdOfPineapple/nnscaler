@@ -1,0 +1,5 @@
+runs/
+*.log
+logs/
+attn_data/
+checkpoints/
