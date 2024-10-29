@@ -785,6 +785,7 @@ def _gencode(
             continue
         if len(node.device) == 0:
             raise RuntimeError(f"Node {node} device is not set")
+
     # anchor node removed in gener
     graph = IRAdapterGener.gen(graph, cost_fn=None)
     if graph.sched is not None:

@@ -22,8 +22,9 @@ from nnscaler.graph.parser.register import register_op
 from nnscaler.ir import IRTensor
 
 from transformers.cache_utils import Cache, DynamicCache, StaticCache
-# from transformers.models.llama.modeling_llama import LlamaAttention, LLAMA_ATTENTION_CLASSES, apply_rotary_pos_emb, LlamaRMSNorm, repeat_kv, _get_unpad_data
-from transformers.models.phi.modeling_phi import PhiAttention, PHI_ATTENTION_CLASSES, apply_rotary_pos_emb, repeat_kv, _get_unpad_data
+from transformers.models.llama.modeling_llama import LlamaRMSNorm as RMSNorm
+# from transformers.models.phi.modeling_phi import PhiAttention, PHI_ATTENTION_CLASSES, apply_rotary_pos_emb, repeat_kv, _get_unpad_data
+
 from transformers.utils import (
     add_start_docstrings,
     add_start_docstrings_to_model_forward,
@@ -34,6 +35,7 @@ from transformers.utils import (
 )
 
 from custom_trainer import get_iter_cnt, need_save_data
+from phi3 import Phi3Attention as PhiAttention, PHI3_ATTENTION_CLASSES as PHI_ATTENTION_CLASSES, apply_rotary_pos_emb, repeat_kv, _get_unpad_data
 
 
 if is_flash_attn_2_available():
@@ -120,15 +122,15 @@ class CustomAttention(PhiAttention):
         output_attentions: bool = False,
         use_cache: bool = False,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
+        logger.warning_once("You are not running the flash-attention implementation, expect numerical differences.")
+
         bsz, q_len, _ = hidden_states.size()
 
-        query_states = self.q_proj(hidden_states)
-        key_states = self.k_proj(hidden_states)
-        value_states = self.v_proj(hidden_states)
-
-        if self.qk_layernorm:
-            query_states = self.q_layernorm(query_states)
-            key_states = self.k_layernorm(key_states)
+        qkv = self.qkv_proj(hidden_states)
+        query_pos = self.num_heads * self.head_dim
+        query_states = qkv[..., :query_pos]
+        key_states = qkv[..., query_pos : query_pos + self.num_key_value_heads * self.head_dim]
+        value_states = qkv[..., query_pos + self.num_key_value_heads * self.head_dim :]
 
         query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
         key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
@@ -143,36 +145,19 @@ class CustomAttention(PhiAttention):
                     "with a layer index."
                 )
             kv_seq_len += past_key_value.get_usable_length(kv_seq_len, self.layer_idx)
-        cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
+        cos, sin = self.rotary_emb(value_states, position_ids, seq_len=kv_seq_len)
 
-        # Partial rotary embedding
-        query_rot, query_pass = (
-            query_states[..., : self.rotary_emb.dim],
-            query_states[..., self.rotary_emb.dim :],
-        )
-        key_rot, key_pass = (
-            key_states[..., : self.rotary_emb.dim],
-            key_states[..., self.rotary_emb.dim :],
-        )
-        # [batch_size, seq_length, num_heads, head_dim // config.partial_rotary_factor]
-        query_rot, key_rot = apply_rotary_pos_emb(query_rot, key_rot, cos, sin, position_ids)
-
-        # [batch_size, seq_length, num_heads, head_dim]
-        query_states = torch.cat((query_rot, query_pass), dim=-1)
-        key_states = torch.cat((key_rot, key_pass), dim=-1)
+        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
 
         if past_key_value is not None:
-            cache_kwargs = {"sin": sin, "cos": cos, "partial_rotation_size": self.rotary_emb.dim}
+            cache_kwargs = {"sin": sin, "cos": cos}  # Specific to RoPE models
             key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
 
+        # repeat k/v heads if n_kv_heads < n_heads
         key_states = repeat_kv(key_states, self.num_key_value_groups)
         value_states = repeat_kv(value_states, self.num_key_value_groups)
 
-        # Queries and keys upcast to fp32 is required by Phi-2 to avoid overflow
-        attn_weights = torch.matmul(
-            query_states.to(torch.float32), key_states.to(torch.float32).transpose(2, 3)
-        ) / math.sqrt(self.head_dim)
-        attn_weights = capture_attention_forward(attn_weights, self.layer_idx)  
+        attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
 
         if attn_weights.size() != (bsz, self.num_heads, q_len, kv_seq_len):
             raise ValueError(
@@ -189,8 +174,9 @@ class CustomAttention(PhiAttention):
 
         # upcast attention to fp32
         attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(value_states.dtype)
-        attn_weights = nn.functional.dropout(attn_weights, p=self.attention_dropout, training=self.training)
+        attn_weights = capture_attention_forward(attn_weights, self.layer_idx)
 
+        attn_weights = nn.functional.dropout(attn_weights, p=self.attention_dropout, training=self.training)
         attn_output = torch.matmul(attn_weights, value_states)
 
         if attn_output.size() != (bsz, self.num_heads, q_len, self.head_dim):
@@ -202,7 +188,7 @@ class CustomAttention(PhiAttention):
         attn_output = attn_output.transpose(1, 2).contiguous()
         attn_output = attn_output.reshape(bsz, q_len, self.hidden_size)
 
-        attn_output = self.dense(attn_output)
+        attn_output = self.o_proj(attn_output)
 
         if not output_attentions:
             attn_weights = None
@@ -429,10 +415,31 @@ def phi_flash_attention_anno(query_states, key_states, value_states, attention_m
 
 register_op(phi_flash_attention_anno)(nnscaler_flash_attention_forward)
 
-def nnscaler_phi_init(attn_type: str='flash', attn_save_path: str=None):
+def nnscaler_phi_init(attn_type: str='flash', attn_save_path: str=None, module_path: str=None):
     if attn_save_path:
         global ATTN_SAVE_DIR
         ATTN_SAVE_DIR = attn_save_path
+    
+    if module_path:
+        import importlib
+        module = importlib.import_module(module_path)
+
+        global PhiAttention, PHI_ATTENTION_CLASSES, apply_rotary_pos_emb, repeat_kv, _get_unpad_data, RMSNorm
+        PhiAttention = getattr(module, 'Phi3Attention')
+
+        PHI_ATTENTION_CLASSES = getattr(module, 'PHI3_ATTENTION_CLASSES')
+        if attn_type == 'flash':
+            PHI_ATTENTION_CLASSES["flash_attention_2"] = NNScalerPhiFlashAttention2
+        elif attn_type == 'custom':
+            PHI_ATTENTION_CLASSES["eager"] = CustomAttention
+            print(f"|{__name__}| After modification: {getattr(module, 'PHI3_ATTENTION_CLASSES')}")
+        else:
+            raise ValueError(f"Invalid attention type {attn_type}")
+
+        apply_rotary_pos_emb = getattr(module, 'apply_rotary_pos_emb')
+        repeat_kv = getattr(module, 'repeat_kv')
+        _get_unpad_data = getattr(module, '_get_unpad_data')
+        RMSNorm = getattr(module, 'Phi3RMSNorm')
 
     if attn_type == 'flash':
         PHI_ATTENTION_CLASSES["flash_attention_2"] = NNScalerPhiFlashAttention2
@@ -441,4 +448,4 @@ def nnscaler_phi_init(attn_type: str='flash', attn_save_path: str=None):
     else:
         raise ValueError(f"Invalid attention type {attn_type}")
 
-    # LlamaRMSNorm.forward = rmsnorm_fwd
+    RMSNorm.forward = rmsnorm_fwd

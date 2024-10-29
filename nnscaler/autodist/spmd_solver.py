@@ -1380,7 +1380,7 @@ class SPMDSolver:
         '''
         if self.autodist_config.solver == 'ilp':
             return self.do_ilp(intervals, topk)
-        elif self.autodist_config.solver == 'dp':
+        elif self.autodist_config.solver == 'dp': # default (see `autodist_config.py`)
             return self.do_dp(intervals, topk)
         else:
             raise RuntimeError(

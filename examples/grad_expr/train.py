@@ -174,7 +174,7 @@ def main(args):
         # - memory constraint is set to 64GB
         # - recompute by the transformer layer in Llama
         pas_config={
-            'mem_constraint': 64,
+            # 'mem_constraint': 64,
             'recompute_modules': 'LlamaDecoderLayer',
         },
     )

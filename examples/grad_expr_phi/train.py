@@ -9,7 +9,7 @@ from datasets import load_from_disk
 import huggingface_hub
 import torch
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer, DataCollatorForLanguageModeling
-from modeling_modifier import nnscaler_phi_init
+from modeling_modifier import nnscaler_phi_init, CustomAttention
 from chunk_linear_cross_entropy import chunk_linear_cross_entropy
 from custom_trainer import CustomTrainer as Trainer # from nnscaler.cli.trainer import Trainer
 
@@ -59,11 +59,37 @@ def get_tokenizer(tokenizer_name_or_path,
         tokenizer.model_max_length = model_max_length
     return tokenizer
 
+def get_module_path(model_id: str):
+    model = AutoModelForCausalLM.from_pretrained(model_id, trust_remote_code=True)
+    module_path = str(model.__class__.__module__)
+    del model
+
+    return module_path
 
 class WrapperModel(torch.nn.Module):
+    # def __init__(self, model_id, attn_type: str='custom'):
+    #     super().__init__()
+    #     self.model = AutoModelForCausalLM.from_pretrained(
+    #         model_id, 
+    #         attn_implementation='flash_attention_2' if attn_type != 'custom' else 'eager',
+    #         trust_remote_code=True
+    #     )
+    #     if attn_type == 'custom':
+    #         import importlib
+    #         module = importlib.import_module(str(self.model.__class__.__module__))
+    #         Phi3DecoderLayer = getattr(module, 'Phi3DecoderLayer')
+
+    #         for name, model_module in self.model.named_modules():
+    #             if isinstance(model_module, Phi3DecoderLayer):
+    #                 layer_idx = model_module.self_attn.layer_idx
+    #                 model_module.self_attn = CustomAttention(model_module.self_attn.config, layer_idx)
+
+    #     self.attn_type = attn_type
+    #     self.iter_idx = 0
     def __init__(self, model_id, attn_type: str='custom'):
         super().__init__()
-        self.model = AutoModelForCausalLM.from_pretrained(
+        from phi3 import Phi3ForCausalLM
+        self.model = Phi3ForCausalLM.from_pretrained(
             model_id, 
             attn_implementation='flash_attention_2' if attn_type != 'custom' else 'eager',
             trust_remote_code=True
@@ -108,6 +134,14 @@ def aggregate_outputs_fn(loss_outputs, sync_group) -> AggregatedOutputs:
 
 def main(args):
 
+    # if os.environ.get("DEBUG_MODE") == "1":
+    #     import debugpy
+    #     # Each process uses a unique port based on its rank
+    #     port = 5678 + int(os.environ.get("LOCAL_RANK", 0))
+    #     debugpy.listen(("0.0.0.0", port))
+    #     print(f"Waiting for debugger attach on rank {os.environ['LOCAL_RANK']} (port {port})...")
+    #     debugpy.wait_for_client() 
+
     if args.run_mode == 'run':
         broadcast_strategy = 'all'
     else:
@@ -117,6 +151,7 @@ def main(args):
 
     if args.attn_type == 'custom':
         logger.info('Using custom attention for gradient experiment')   
+
     nnscaler_phi_init(
         attn_type=args.attn_type,
         attn_save_path=args.attn_save_path,
@@ -173,10 +208,9 @@ def main(args):
         use_end2end=True,
         # autodist config:
         # - memory constraint is set to 64GB
-        # - recompute by the transformer layer in Llama
         pas_config={
             'mem_constraint': 64,
-            'recompute_modules': 'LlamaDecoderLayer',
+            'recompute_modules': 'Phi3DecoderLayer',
         },
     )
 
@@ -271,13 +305,13 @@ if __name__ == '__main__':
     ## Parse Args ##
     parser = argparse.ArgumentParser()
     
-    parser.add_argument('--name', type=str, default='llama3-8b', help='name of the experiment')
+    parser.add_argument('--name', type=str, default='phi-grad', help='name of the experiment')
     parser.add_argument('--run_mode', type=str, default='run', choices=['run', 'compile'], help='run or compile')
     parser.add_argument('--plan_ngpus', type=int, required=True, help='specify the scale unit size')
     parser.add_argument('--runtime_ngpus', type=int, required=True, help='specify the number of GPUs to use')
     parser.add_argument('--resume_path', type=str, default=None, help='path to dir of ckpts or the ckpt file to resume from')
     parser.add_argument('--dataset_path', type=str, default=None, help='path to the dataset')
-    parser.add_argument('--model_id', type=str, default='microsoft/llama-gpt3-8b', help='transformers model id')
+    parser.add_argument('--model_id', type=str, default='microsoft/Phi-3-mini-4k-instruct', help='transformers model id')
     parser.add_argument('-p', '--disable_progressbar',action='store_true',help='transformers model id',)
 
     parser.add_argument('--n_iter', type=int, default=None, help='Number of iterations')
