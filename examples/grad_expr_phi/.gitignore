@@ -1,6 +1,0 @@
-runs/
-logs/
-attn_data/
-checkpoints/
-
-*.log
