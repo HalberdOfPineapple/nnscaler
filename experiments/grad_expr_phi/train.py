@@ -43,7 +43,7 @@ def get_tokenizer(tokenizer_name_or_path,
                   default_pad_token="[PAD]",
                   default_unk_token="<unk>"):
 
-    tokenizer = AutoTokenizer.from_pretrained(tokenizer_name_or_path)
+    tokenizer = AutoTokenizer.from_pretrained(tokenizer_name_or_path, trust_remote_code=True)
     special_tokens_dict = dict()
     if tokenizer.pad_token is None:
         special_tokens_dict["pad_token"] = default_pad_token
@@ -67,33 +67,22 @@ def get_module_path(model_id: str):
     return module_path
 
 class WrapperModel(torch.nn.Module):
-    # def __init__(self, model_id, attn_type: str='custom'):
-    #     super().__init__()
-    #     self.model = AutoModelForCausalLM.from_pretrained(
-    #         model_id, 
-    #         attn_implementation='flash_attention_2' if attn_type != 'custom' else 'eager',
-    #         trust_remote_code=True
-    #     )
-    #     if attn_type == 'custom':
-    #         import importlib
-    #         module = importlib.import_module(str(self.model.__class__.__module__))
-    #         Phi3DecoderLayer = getattr(module, 'Phi3DecoderLayer')
-
-    #         for name, model_module in self.model.named_modules():
-    #             if isinstance(model_module, Phi3DecoderLayer):
-    #                 layer_idx = model_module.self_attn.layer_idx
-    #                 model_module.self_attn = CustomAttention(model_module.self_attn.config, layer_idx)
-
-    #     self.attn_type = attn_type
-    #     self.iter_idx = 0
-    def __init__(self, model_id, attn_type: str='custom'):
+    def __init__(self, model_id, attn_type: str='custom', config_path: str=None):
         super().__init__()
         from phi3 import Phi3ForCausalLM
-        self.model = Phi3ForCausalLM.from_pretrained(
-            model_id, 
-            attn_implementation='flash_attention_2' if attn_type != 'custom' else 'eager',
-            trust_remote_code=True
-        )
+        if not config_path:
+            self.model = Phi3ForCausalLM.from_pretrained(
+                model_id, 
+                attn_implementation='flash_attention_2' if attn_type != 'custom' else 'eager',
+                trust_remote_code=True
+            )
+        else:
+            self.model = Phi3ForCausalLM.from_pretrained(
+                model_id,
+                config=AutoConfig.from_pretrained(config_path, trust_remote_code=True),
+                attn_implementation='flash_attention_2' if attn_type != 'custom' else 'eager',
+                trust_remote_code=True,
+            )
         self.attn_type = attn_type
         self.iter_idx = 0
 
@@ -207,9 +196,8 @@ def main(args):
         use_zero=True,
         use_end2end=True,
         # autodist config:
-        # - memory constraint is set to 64GB
         pas_config={
-            'mem_constraint': 64,
+            # 'mem_constraint': 64, # - memory constraint is set to 64GB
             'recompute_modules': 'Phi3DecoderLayer',
         },
     )
@@ -219,6 +207,7 @@ def main(args):
         args={
             'model_id': args.model_id,
             'attn_type': args.attn_type,
+            'config_path': args.model_config_path,
         },
     )
 
@@ -270,11 +259,16 @@ def main(args):
         },
     )
 
+    scaling_factor: int = runtime_ngpus // args.plan_ngpus
     trainer_args = TrainerArgs(
+        global_batch_size=args.global_batch_size,
+        micro_batch_size=args.micro_batch_size,
+        grad_accumulation_steps=args.global_batch_size // args.micro_batch_size,
+
         pas_policy='autodist',
         precision='bf16',
-        grad_accumulation_steps=4,
         seed=0,
+        gen_reuse='override', # override the generated files if not matching
 
         gen_savedir=args.compile_save_path,
         instance_name=args.name,
@@ -305,13 +299,17 @@ def print_args(args: argparse.Namespace):
     print("=" * 80)
     print(f"Start Experiment:\t{args.name}")
     print(f"Run Mode:\t{args.run_mode}")
-    print(f"Plan GPUs:\t{args.plan_ngpus}")
-    print(f"Runtime GPUs:\t{args.runtime_ngpus}")
+    print(f"Total number of GPUs:\t{args.runtime_ngpus}")
+    print(f"GPU unit size:\t{args.plan_ngpus}")
     print(f"Model ID:\t{args.model_id}")
 
     print('-' * 40)
     print(f"Number of Iterations:\t{args.n_iter}")
     print(f"Number of Epochs:\t{args.n_epochs}")
+    print(f'Global Batch Size:\t{args.global_batch_size}')
+    print(f'Micro Batch Size:\t{args.micro_batch_size}')
+    print(f"Scaling Factor (INFERRED):\t{args.runtime_ngpus // args.plan_ngpus}")
+    print(f"Gradient Accumulation Steps (INFERRED):\t{args.global_batch_size // args.micro_batch_size}")
     print(f"Attention Type:\t{args.attn_type}")
     print(f"Save Attention Data Every {args.save_step} Steps")
 
@@ -332,19 +330,23 @@ if __name__ == '__main__':
     parser.add_argument('--plan_ngpus', type=int, required=True, help='specify the scale unit size')
     parser.add_argument('--runtime_ngpus', type=int, required=True, help='specify the number of GPUs to use')
     
-    parser.add_argument('--dataset_path', type=str, default=None, help='path to the dataset')
-    parser.add_argument('--model_id', type=str, default='microsoft/Phi-3-mini-4k-instruct', help='transformers model id')
-    parser.add_argument('-p', '--disable_progressbar',action='store_true',help='transformers model id',)
-
     parser.add_argument('--n_iter', type=int, default=None, help='Number of iterations')
     parser.add_argument('--n_epochs', type=int, default=None, help='Number of epochs')
+    parser.add_argument('--global_batch_size', type=int, default=4, help='global batch size')
+    parser.add_argument('--micro_batch_size', type=int, default=1, help='micro batch size')
+
+    parser.add_argument('--model_id', type=str, default='microsoft/Phi-3-mini-4k-instruct', help='transformers model id')
+    parser.add_argument('--model_config_path', type=str, default=None, help='path to the model config')
     parser.add_argument('-a', '--attn_type', type=str, default='custom', help='attention type')
     parser.add_argument('-s', '--save_step', type=int, default=1, help='Save attention data every n steps')
     parser.add_argument('--compile_save_path', type=str, default='./.nnscaler', help='path to save compiled code')
     parser.add_argument('--attn_save_path', type=str, default=None, help='path to save attention data')
     parser.add_argument('--tf_log_dir', type=str, default=None, help='path to save tensorboard logs')
     parser.add_argument('--ckpt_save_dir', type=str, default=None, help='path to save checkpoints')
+    parser.add_argument('--dataset_path', type=str, default=None, help='path to the dataset')
     parser.add_argument('--check_resume', action='store_true', help='whether to resume from checkpoint')
+
+    parser.add_argument('-p', '--disable_progressbar',action='store_true',help='transformers model id',)
 
     args = parser.parse_args()
     print_args(args)

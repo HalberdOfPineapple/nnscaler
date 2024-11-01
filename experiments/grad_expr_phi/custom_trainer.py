@@ -4,6 +4,7 @@ import psutil
 import logging
 from tqdm import tqdm
 from pathlib import Path
+from datetime import timedelta
 from collections import defaultdict
 from dataclasses import dataclass, asdict
 from typing import Any, Dict, List, Optional, Union
@@ -46,8 +47,10 @@ class CustomTrainer(Trainer):
         """
         # Call the parent class's initializer with the existing parameters
         super().__init__(argv=argv, train_args=train_args)
-        torch.distributed.init_process_group(backend='nccl')
-        
+        torch.distributed.init_process_group(
+            backend='nccl',
+            timeout=timedelta(hours=5),
+        )
         
         global SAVE_ITERVAL
         SAVE_ITERVAL = save_data_steps
