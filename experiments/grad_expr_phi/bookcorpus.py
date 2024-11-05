@@ -47,6 +47,7 @@ if __name__ == '__main__':
     parser.add_argument('--save_path', help='the path to save the tokenized dataset', type=str, required=True)
     parser.add_argument('--sequence_length', help='the length of each sample in the tokenized dataset, usually set to the max sequence length', type=int, required=True)
     args = parser.parse_args()
+
     data_path_or_name = args.data_path_or_name
     tokenizer_path_or_name = args.tokenizer_path_or_name
     save_path = args.save_path
@@ -56,6 +57,7 @@ if __name__ == '__main__':
     tokenizer = get_tokenizer(tokenizer_path_or_name)
     dataset = create_dataset(tokenizer, raw_dataset, "text", sequence_length)
     dataset.save_to_disk(save_path)
+
     # used by fairseq dataset
     sizes = numpy.array(dataset["length"])
     torch.save(sizes, f"{save_path}/fairseq_dataset_sizes.np")
