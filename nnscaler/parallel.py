@@ -396,7 +396,7 @@ class ReuseType(Enum):
     """The reuse type"""
     MATCH = 'match'        # reuse if present and match, error if present but not match, generate if not present.
     OVERRIDE = 'override'  # no reuse, everything will be regenerated.
-    MOO = 'moo'            # (short for match or override)reuse if present and match, generate if not match or not present.
+    MOO = 'moo'            # (short for match or override) reuse if present and match, generate if not match or not present.
     GRAPH = 'graph'        # reuse graph only if present and match, generate otherwise.
 
 

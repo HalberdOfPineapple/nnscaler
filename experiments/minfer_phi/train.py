@@ -1,17 +1,17 @@
 #  Copyright (c) Microsoft Corporation.
 #  Licensed under the MIT License.
-
-import argparse
 import os
-
-import datasets
-from datasets import load_from_disk
-import huggingface_hub
+import yaml
 import torch
+import datasets
+import argparse
+import huggingface_hub
+from typing import Dict
+from datasets import load_from_disk
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer, DataCollatorForLanguageModeling
-from modeling_modifier import nnscaler_phi_init
-from chunk_linear_cross_entropy import chunk_linear_cross_entropy
-from custom_trainer import CustomTrainer as Trainer # from nnscaler.cli.trainer import Trainer
+
+from minference import MInference
+from minference.minference_configuration import MInferenceConfig
 
 from nnscaler.utils import set_default_logger_level
 from nnscaler.cli.trainer_args import (
@@ -30,12 +30,16 @@ from nnscaler.parallel import ComputeConfig, BroadcastGenFilesStrategy
 from nnscaler.runtime.f16_optimizer import MixedPrecisionAdamW
 from nnscaler.cli.loggers.tensorboard import TensorBoardLogger
 
-from minference import MInference
+from phi3 import Phi3ForCausalLM
+from minfer_modifier import minfer_phi_init
+from chunk_linear_cross_entropy import chunk_linear_cross_entropy
+from custom_trainer import CustomTrainer as Trainer # from nnscaler.cli.trainer import Trainer
 
 import logging
 logger = logging.getLogger(__name__)
 
 IGNORE_IDX = -100
+MINFER_CONFIG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'configs')
 
 
 def get_tokenizer(tokenizer_name_or_path,
@@ -68,27 +72,69 @@ def get_module_path(model_id: str):
 
     return module_path
 
+
+def minfer_patch_setup(model, minfer_config: MInferenceConfig):
+    if minfer_config.attn_type != "vllm":
+            model.config.starting_layer = minfer_config.starting_layer
+            model.config.config_path = minfer_config.config_path
+
+    if minfer_config.attn_type == "minference":
+        model.config.is_search = minfer_config.is_search
+
+    elif minfer_config.attn_type == "minference_with_dense":
+        model.config.dense = True
+
+    elif minfer_config.attn_type == "dilated1":
+        model.config.dilated1 = True
+
+    elif minfer_config.attn_type == "static":
+        model.config.static_pattern = True
+    elif minfer_config.attn_type == "dilated2":
+        model.config.dilated2 = True
+
+    elif minfer_config.attn_type == "streaming":
+        model.config.streaming = True
+        model.config.streaming_kwargs = {
+            "n_local": 3968,
+            "n_init": 128,
+            **minfer_config.attn_kwargs,
+        }
+    elif minfer_config.attn_type == "hf":
+        pass
+    else:
+        raise ValueError(
+            f"The attention type {minfer_config.attn_type} is currently not supported for training"
+        )
+    return model
+
+
 class WrapperModel(torch.nn.Module):
-    def __init__(self, model_id, attn_type: str='custom', config_path: str=None):
+    def __init__(self, model_id, config_path: str=None, minfer_config: Dict={}):
         super().__init__()
-        from phi3 import Phi3ForCausalLM
+        
         if not config_path:
             self.model = Phi3ForCausalLM.from_pretrained(
                 model_id, 
-                attn_implementation='flash_attention_2' if attn_type != 'custom' else 'eager',
                 trust_remote_code=True
             )
         else:
+            model_config = AutoConfig.from_pretrained(config_path, trust_remote_code=True)
             self.model = Phi3ForCausalLM.from_pretrained(
                 model_id,
-                config=AutoConfig.from_pretrained(config_path, trust_remote_code=True),
-                attn_implementation='flash_attention_2' if attn_type != 'custom' else 'eager',
+                config=model_config,
                 trust_remote_code=True,
             )
-        self.attn_type = attn_type
-
-        # minference_patch = MInference("minference", model_id)
-        # self.model = minference_patch(self.model)
+        
+        minfer_attn_type = minfer_config.pop('attn_type', 'minference')
+        minfer = MInference(
+            attn_type=minfer_attn_type,
+            model_name=model_id,
+            **minfer_config,
+        )
+        minfer_config: MInferenceConfig = minfer.config
+        
+        self.model = minfer_patch_setup(self.model, minfer_config)
+        self.model = minfer_phi_init(self.model, model_id, minfer_config)
         
 
     def forward(self, samples):
@@ -130,11 +176,18 @@ def main(args):
 
     # if os.environ.get("DEBUG_MODE") == "1":
     #     import debugpy
-    #     # Each process uses a unique port based on its rank
-    #     port = 5678 + int(os.environ.get("LOCAL_RANK", 0))
+    #     base_port = 5678
+    #     port = base_port + int(os.environ["LOCAL_RANK"])
     #     debugpy.listen(("0.0.0.0", port))
     #     print(f"Waiting for debugger attach on rank {os.environ['LOCAL_RANK']} (port {port})...")
-    #     debugpy.wait_for_client() 
+    #     debugpy.wait_for_client()
+
+    minfer_config_path = os.path.join(MINFER_CONFIG_DIR, f'{args.name}.yaml')
+    if not os.path.exists(minfer_config_path):
+        minfer_config = {}
+    else:
+        with open(minfer_config_path, 'r') as f:
+            minfer_config = yaml.safe_load(f)
 
     if args.run_mode == 'run':
         broadcast_strategy = 'all'
@@ -142,14 +195,7 @@ def main(args):
         broadcast_strategy = 'none'
 
     set_default_logger_level('INFO')
-
-    if args.attn_type == 'custom':
-        logger.info('Using custom attention for gradient experiment')   
-
-    nnscaler_phi_init(
-        attn_type=args.attn_type,
-        attn_save_path=args.attn_save_path,
-    )
+    
 
     ## Setup Dataset ##
     dataset = load_from_disk(args.dataset_path)
@@ -211,8 +257,8 @@ def main(args):
         type=WrapperModel,
         args={
             'model_id': args.model_id,
-            'attn_type': args.attn_type,
             'config_path': args.model_config_path,
+            'minfer_config': minfer_config,
         },
     )
 
@@ -273,7 +319,8 @@ def main(args):
         pas_policy='autodist',
         precision='bf16',
         seed=0,
-        gen_reuse='override', # override the generated files if not matching
+        # gen_reuse='override', # override the generated files if not matching
+        gen_reuse='match',
 
         gen_savedir=args.compile_save_path,
         instance_name=args.name,
@@ -315,10 +362,10 @@ def print_args(args: argparse.Namespace):
     print(f'Micro Batch Size:\t{args.micro_batch_size}')
     print(f"Scaling Factor (INFERRED):\t{args.runtime_ngpus // args.plan_ngpus}")
     print(f"Gradient Accumulation Steps (INFERRED):\t{args.global_batch_size // args.micro_batch_size}")
-    print(f"Attention Type:\t{args.attn_type}")
     print(f"Save Attention Data Every {args.save_step} Steps")
 
     print('-' * 40)
+    print(f'MInferenece Config Path:\t{args.minfer_config_path}')
     print(f"Compile Save Path:\t{args.compile_save_path}")
     print(f"Attention Save Path:\t{args.attn_save_path}")
     print(f"Tensorboard Log Path:\t{args.tf_log_dir}")
@@ -342,8 +389,9 @@ if __name__ == '__main__':
 
     parser.add_argument('--model_id', type=str, default='microsoft/Phi-3-mini-4k-instruct', help='transformers model id')
     parser.add_argument('--model_config_path', type=str, default=None, help='path to the model config')
-    parser.add_argument('-a', '--attn_type', type=str, default='custom', help='attention type')
     parser.add_argument('-s', '--save_step', type=int, default=1, help='Save attention data every n steps')
+
+    parser.add_argument('--minfer_config_path', type=str, default=None, help='path to minference config')
     parser.add_argument('--compile_save_path', type=str, default='./.nnscaler', help='path to save compiled code')
     parser.add_argument('--attn_save_path', type=str, default=None, help='path to save attention data')
     parser.add_argument('--tf_log_dir', type=str, default=None, help='path to save tensorboard logs')

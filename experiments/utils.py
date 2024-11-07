@@ -4,6 +4,7 @@
 from typing import List, Union, Callable, Optional, Tuple
 import logging
 
+import re
 import torch
 
 import nnscaler

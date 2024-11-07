@@ -6,6 +6,7 @@
 # 2. replace the un-fused RMSNorm with apex's fused version
 import os
 import math
+import json
 import types
 import torch
 import logging
@@ -17,30 +18,39 @@ import torch.nn.functional as F
 logger = logging.getLogger(__name__)
 
 from torch import nn
-from typing import List, Optional, Tuple, Union, Any
+from typing import List, Optional, Tuple, Union, Any, Dict
 
 from nnscaler.graph.parser.register import register_op
 from nnscaler.ir import IRTensor
 
-from transformers.cache_utils import Cache, DynamicCache, StaticCache
-from transformers.models.llama.modeling_llama import LlamaRMSNorm as RMSNorm
 from transformers.utils import (
-    add_start_docstrings,
-    add_start_docstrings_to_model_forward,
     is_flash_attn_2_available,
     is_flash_attn_greater_or_equal_2_10,
     logging,
-    replace_return_docstrings,
+)
+from transformers.cache_utils import Cache
+
+
+from minference import MInference
+from minference.patch import forward_llama_decoder_layer
+from minference.minference_configuration import MInferenceConfig
+from minference.modules.minference_forward import (
+    # init_minference_parameters, 
+    get_cos_sin, search_pattern, gather_qkv,
+    LAST_Q_MASK, sum_all_diagonal_matrix
 )
 
-from custom_trainer import get_iter_cnt, need_save_data
-from phi3 import Phi3Config as PhiConfig, Phi3Attention as PhiAttention, PHI3_ATTENTION_CLASSES as PHI_ATTENTION_CLASSES, apply_rotary_pos_emb, repeat_kv, _get_unpad_data
-from transformers.models.llama.modeling_llama import LlamaAttention
+from minference.patch import (
+    hf_437_prepare_inputs_for_generation, _prepare_decoder_attention_mask_inference, 
+    forward_llama_model, forward_llama_for_causal_lm
+)
+
+from minfer_ops import vs_attn_forward, bs_attn_forward, streaming_forward
+from phi3 import Phi3ForCausalLM, Phi3Attention as PhiAttention, apply_rotary_pos_emb, repeat_kv, _get_unpad_data
 
 if is_flash_attn_2_available():
     from flash_attn import flash_attn_func, flash_attn_varlen_func
     from flash_attn.bert_padding import index_first_axis, pad_input, unpad_input  # noqa
-
 
 try:
     from apex.normalization.fused_layer_norm import fused_rms_norm_affine # type: ignore
@@ -351,23 +361,45 @@ def phi_flash_attention_anno(query_states, key_states, value_states, attention_m
 
 register_op(phi_flash_attention_anno)(nnscaler_flash_attention_forward)
 
+# ROPE_TYPE = None
+# def set_rope_type(self):
+#     global ROPE_TYPE
+#     if ROPE_TYPE is not None:
+#         return
+#     if "seq_len" in inspect.signature(self.rotary_emb.forward).parameters:
+#         if "position_ids" in inspect.signature(self.rotary_emb.forward).parameters:
+#             ROPE_TYPE = "seq_len,position_ids"
+#         else:
+#             ROPE_TYPE = "seq_len"
+#     elif "max_seq_len" in inspect.signature(self.rotary_emb.forward).parameters:
+#         ROPE_TYPE = "max_seq_len"
+#     else:
+#         ROPE_TYPE = "position_ids"
+# def get_rope_type():
+#     from minference.modules.minference_forward import ROPE_TYPE
+#     return ROPE_TYPE
 
-import json
-from phi3 import Phi3ForCausalLM
-from minference import MInference
-from minference.patch import forward_llama_decoder_layer
-from minference.modules.minference_forward import (
-    init_minference_parameters, gather_last_q_vertical_slash_topk_v4, 
-    set_rope_type, get_cos_sin, search_pattern, gather_qkv,
-    LAST_Q_MASK, sum_all_diagonal_matrix
-)
-from minference.ops.pit_sparse_flash_attention_v2 import vertical_slash_sparse_attention
-from minference.ops.block_sparse_flash_attention import block_sparse_attention
+def init_minference_parameters(self):
+    config = self.config.to_dict()
+    self.starting_layer = config.get("starting_layer", 0)
+    self.is_search = config.get("is_search", False)
+
+    self.ne_inf = None
+    self.config_path = config.get("config_path", "")
+    if (
+        self.config_path is not None and
+        os.path.exists(self.config_path) and
+        self.layer_idx < len(json.load(open(self.config_path)))
+    ):
+        self.best_pattern = {int(ii): jj for ii, jj in json.load(open(self.config_path))[self.layer_idx].items()}
+    else:
+        self.best_pattern = {}
+    self.vertical, self.slash = None, None
+
+    # import apply_rotary_pos_emb
+    self.apply_rotary_pos_emb = True
 
 
-def get_rope_type():
-    from minference.modules.minference_forward import ROPE_TYPE
-    return ROPE_TYPE
 
 def minference_forward():
     def forward(
@@ -410,17 +442,22 @@ def minference_forward():
             kv_seq_len += past_key_value.get_usable_length(kv_seq_len, self.layer_idx)
 
 
-        set_rope_type(self)
-        cos, sin = get_cos_sin(self, value_states, kv_seq_len, position_ids)
-        if get_rope_type() == "max_seq_len":
-            if cos.device != query_states.device:
-                cos = cos.to(query_states.device)
-            query_states = apply_rotary_pos_emb(query_states, cos)
-            key_states = apply_rotary_pos_emb(key_states, cos)
-        else:
-            if position_ids is not None and position_ids.device != cos.device:
-                position_ids = position_ids.to(cos.device)
-            query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
+        # Currently disable the dynamic adjustment of Rope and fix the specific setting for Phi:
+        # --------------------------------------------------------------------------------------
+        # set_rope_type(self)
+        # cos, sin = get_cos_sin(self, value_states, kv_seq_len, position_ids)
+        # if get_rope_type() == "max_seq_len":
+        #     if cos.device != query_states.device:
+        #         cos = cos.to(query_states.device)
+        #     query_states = apply_rotary_pos_emb(query_states, cos)
+        #     key_states = apply_rotary_pos_emb(key_states, cos)
+        # else:
+        #     if position_ids is not None and position_ids.device != cos.device:
+        #         position_ids = position_ids.to(cos.device)
+        #     query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
+        # ------------------------------
+        cos, sin = self.rotary_emb(value_states, position_ids, seq_len=kv_seq_len)
+        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
 
         if past_key_value is not None:
             cache_kwargs = {"sin": sin, "cos": cos}  # Specific to RoPE models
@@ -451,7 +488,8 @@ def minference_forward():
                 # If search mode is enabled and the current layer has not already been configured 
                 # => search for the best pattern
                 if self.is_search and self.layer_idx >= len(config_list):
-                    config[head] = search_pattern(q, k, head)
+                    with torch.no_grad():
+                        config[head] = search_pattern(q, k, head)
 
                 # if search is disabled and the current layer is beyond  starting layer 
                 # => apply the kernel for calculating the attention based on the best pattern
@@ -476,7 +514,12 @@ def minference_forward():
                 with open(self.config_path, 'w') as json_file:
                     json.dump(config_list, json_file)
         else:
-            output =  flash_attn_func(query_states.transpose(1, 2), key_states.transpose(1, 2), value_states.transpose(1,2), 0.0, softmax_scale=None, causal=q_len != 1).view(bsz, query_states.size(1), q_len, self.head_dim)
+            output =  flash_attn_func(
+                query_states.transpose(1, 2), 
+                key_states.transpose(1, 2), 
+                value_states.transpose(1,2), 
+                0.0, softmax_scale=None, causal=q_len != 1
+            ).view(bsz, query_states.size(1), q_len, self.head_dim)
         attn_output = output.transpose(1, 2).contiguous()
         attn_output = attn_output.reshape(bsz, q_len, self.num_heads * self.head_dim)
         attn_output = self.o_proj(attn_output)
@@ -485,41 +528,18 @@ def minference_forward():
 
     return forward
 
+def last_q_mask_to(last_q_mask: torch.Tensor, device) -> torch.Tensor:
+    return last_q_mask.to(device)
+register_op('b^ h^ l^ l^ -> b^ h^ l^ l^')(last_q_mask_to)
 
-
-HEAD_ATTN_FW_ANNO = 'b num_head^ l^ hd^, b num_head^ l^ hd^, b num_head^ l hd^ -> b num_head^ l^ l^'
-class CustomVSSAttention(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, q, k, v, vertical_topk, slash):
-        ctx.save_for_backward(q, k, v, vertical_topk, slash)
-        return vertical_slash_sparse_attention(q, k, v, vertical_topk, slash)
-
-    @staticmethod
-    def backward(ctx, grad_output):
-        # TODO: Implement backward pass
-        return None, None, None, None, None
-
-def vs_attn_forward(q, k, v, vertical_topk, slash):
-    return CustomVSSAttention.apply(q, k, v, vertical_topk, slash)
-register_op(HEAD_ATTN_FW_ANNO)(vs_attn_forward)
-
-class CustomBSAttention(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, q, k, v, topk):
-        ctx.save_for_backward(q, k, v, topk)
-        return block_sparse_attention(q, k, v, topk)
-    
-    @staticmethod
-    def backward(ctx, grad_output):
-        # TODO: Implement backward pass
-        return None, None, None, None
-def bs_attn_forward(q, k, v, topk):
-    return CustomBSAttention.apply(q, k, v, topk)
-register_op(HEAD_ATTN_FW_ANNO)(bs_attn_forward)
+def qk_einsum(q, k, head_dim):
+    return torch.einsum(f'bhmk, bhnk -> bhmn', q, k) / math.sqrt(head_dim)
+register_op('b^ h^ last_l^ d^, b^ h^ l^ d^ -> b^ h^ last_l^ l^')(qk_einsum)
 
 def minfer_attn_forward(self, q, k, v, head_id):
     """
         Inputs:
+            self: Attention, the current attention layer
             q: torch.Tensor, shape (bsz, 1, q_len, head_dim)
             k: torch.Tensor, shape (bsz, 1, q_len, head_dim)
             v: torch.Tensor, shape (bsz, 1, q_len, head_dim)
@@ -533,21 +553,27 @@ def minfer_attn_forward(self, q, k, v, head_id):
         )
         return attn_output.view(bsz, 1, q_len, self.head_dim)
 
-    def vertical_and_slash_kernel(q, k, v, vertical_size, slash_size):
+    def vertical_and_slash_kernel(q: torch.Tensor, k, v, vertical_size, slash_size):
         vertical_size, slash_size  = min(q_len, max(vertical_size, 30)), min(q_len, max(slash_size, 50))
 
         last_q = min(64, q_len)
-        qk = torch.einsum(f'bhmk, bhnk -> bhmn', q[:,:,-last_q:,:], k) / math.sqrt(self.head_dim)
-        qk[:, :, :, -last_q:] = torch.where(LAST_Q_MASK[...,-last_q:,-last_q:].to(q.device), qk[:, :, :, -last_q:], -torch.inf)
-        qk = torch.nn.functional.softmax(qk, dim=-1, dtype=torch.float32)
 
-        vertical = qk.sum(-2, keepdim=True)
-        vertical[..., :30] = torch.inf
-        vertical_topk = torch.topk(vertical, vertical_size, -1).indices
+        with torch.no_grad():
+            # qk = torch.einsum(f'bhmk, bhnk -> bhmn', q[:,:,-last_q:,:], k) / math.sqrt(self.head_dim)
+            qk = qk_einsum(q[:,:,-last_q:,:].clone().detach(), k, self.head_dim)
 
-        slash = sum_all_diagonal_matrix(qk)[...,:-last_q + 1]
-        slash[..., -100:] = torch.inf
-        slash = (q_len - 1) - torch.topk(slash, slash_size, -1).indices
+            # LAST_Q_MASK: torch.Size([1, 1, 64, 64])
+            # qk[:, :, :, -last_q:] = torch.where(LAST_Q_MASK[...,-last_q:,-last_q:].to(q.device), qk[:, :, :, -last_q:], -torch.inf)
+            last_q_mask = LAST_Q_MASK[..., -last_q:, -last_q:]
+            qk[:, :, :, -last_q:] = torch.where(last_q_mask, qk[:, :, :, -last_q:], -torch.inf)
+
+            vertical = qk.sum(-2, keepdim=True)
+            vertical[..., :30] = torch.inf
+            vertical_topk = torch.topk(vertical, vertical_size, -1).indices
+
+            slash = sum_all_diagonal_matrix(qk)[...,:-last_q + 1]
+            slash[..., -100:] = torch.inf
+            slash = (q_len - 1) - torch.topk(slash, slash_size, -1).indices
 
         # return vertical_slash_sparse_attention(q, k, v, vertical_topk, slash)
         return vs_attn_forward(q, k, v, vertical_topk, slash)
@@ -562,22 +588,38 @@ def minfer_attn_forward(self, q, k, v, head_id):
     if q_len == 1: return dense(q, k, v)
 
     ty, vertical_size, slash_size, _ = self.best_pattern.get(head_id, ("vertical_and_slash", 1000, 6096, 1))
+
+    # TODO: DEBUG Setting
+    if ty == 'stream_llm':
+        ty = 'vertical_and_slash'
+        vertical_size, slash_size = 1000, 6096
+
     fc = {
+        "stream_llm": streaming_forward,
         "vertical_and_slash": vertical_and_slash_kernel,
         "block_sparse": block_sparse_kernel,
     }[ty]
 
     return fc(q, k, v, vertical_size, slash_size)
 
-def minfer_phi_init(model: Phi3ForCausalLM, model_id: str):
+def minfer_phi_init(model: Phi3ForCausalLM, model_id: str, minfer_config: MInferenceConfig):
+    # if minfer_config.kv_cache_cpu:
+    #     global KV_CACHE_CPU_DEVICE
+    #     KV_CACHE_CPU_DEVICE = minfer_config.kv_cache_cpu_device
+    #     model.config.kv_cache_cpu_device = minfer_config.kv_cache_cpu_device
+    #     return minference_patch_kv_cache_cpu(model)
+    # if minfer_config.use_snapkv:
+    #     return minfer_config(model)
+    if minfer_config.kv_cache_cpu or minfer_config.use_snapkv:
+        raise NotImplementedError("Setup for KV Cache CPU and SnapKV modes are not supported for training")
+
+
     # Note that the Attention, Model and DecoderLayer are not hardcoded classes (e.g. LlamaDecoderLayer)
     # Instead they can fit for any model that uses such an architecture
     Attention = model.model.layers[0].self_attn.__class__
-    Model = model.model.__class__
     DecoderLayer = model.model.layers[0].__class__
 
     forward = minference_forward()
-
     def update_module(m):
         if isinstance(m, Attention):
             m.init_minference_parameters = init_minference_parameters.__get__(
@@ -591,7 +633,23 @@ def minfer_phi_init(model: Phi3ForCausalLM, model_id: str):
             m.forward = forward_llama_decoder_layer.__get__(m, DecoderLayer)
     
     model.apply(update_module)
-    # TODO
+    model.prepare_inputs_for_generation = hf_437_prepare_inputs_for_generation.__get__(
+        model, model.__class__
+    )
+    model.model._use_sdpa = False
+
+    model.model._prepare_decoder_attention_mask = (
+        _prepare_decoder_attention_mask_inference.__get__(
+            model.model, model.model.__class__
+        )
+    )
+    model.model.forward = forward_llama_model.__get__(
+        model.model, model.model.__class__
+    )
+    model.forward = forward_llama_for_causal_lm.__get__(model, model.__class__)
+
+    print(f"{__name__} | Patched model {model.__class__} for minference..")
+    return model
 
 
 

@@ -1,0 +1,5 @@
+attn_type: "minference"
+starting_layer: -1
+kv_cache_cpu: False
+use_snapkv: False
+is_search: False
