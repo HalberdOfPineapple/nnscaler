@@ -2,6 +2,7 @@
 **/__pycache__/
 nnscaler.egg-info/
 **/.nnscaler/
+**.ipynb
 
 nnscaler/autodist/.rendered.dp_solver.cpp
 nnscaler/autodist/dp_solver.cpython-310-x86_64-linux-gnu.so
