@@ -115,14 +115,12 @@ class WrapperModel(torch.nn.Module):
         if not config_path:
             self.model = Phi3ForCausalLM.from_pretrained(
                 model_id, 
-                trust_remote_code=True
             )
         else:
             model_config = AutoConfig.from_pretrained(config_path, trust_remote_code=True)
             self.model = Phi3ForCausalLM.from_pretrained(
                 model_id,
                 config=model_config,
-                trust_remote_code=True,
             )
         
         minfer_attn_type = minfer_config.pop('attn_type', 'minference')
@@ -319,8 +317,7 @@ def main(args):
         pas_policy='autodist',
         precision='bf16',
         seed=0,
-        # gen_reuse='override', # override the generated files if not matching
-        gen_reuse='match',
+        gen_reuse=args.reuse_type,
 
         gen_savedir=args.compile_save_path,
         instance_name=args.name,
@@ -350,6 +347,7 @@ def main(args):
 def print_args(args: argparse.Namespace):
     print("=" * 80)
     print(f"Start Experiment:\t{args.name}")
+    print(f"Reuse Type:\t{args.reuse_type}")
     print(f"Run Mode:\t{args.run_mode}")
     print(f"Total number of GPUs:\t{args.runtime_ngpus}")
     print(f"GPU unit size:\t{args.plan_ngpus}")
@@ -378,6 +376,7 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     
     parser.add_argument('--name', type=str, default='phi-grad', help='name of the experiment')
+    parser.add_argument('--reuse_type', type=str, default='match', choices=['match', 'override', 'moo', 'graph'], help='reuse type')
     parser.add_argument('--run_mode', type=str, default='run', choices=['run', 'compile'], help='run or compile')
     parser.add_argument('--plan_ngpus', type=int, required=True, help='specify the scale unit size')
     parser.add_argument('--runtime_ngpus', type=int, required=True, help='specify the number of GPUs to use')

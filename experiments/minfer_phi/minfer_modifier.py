@@ -32,7 +32,6 @@ from transformers.cache_utils import Cache
 
 
 from minference import MInference
-from minference.patch import forward_llama_decoder_layer
 from minference.minference_configuration import MInferenceConfig
 from minference.modules.minference_forward import (
     # init_minference_parameters, 
@@ -42,10 +41,14 @@ from minference.modules.minference_forward import (
 
 from minference.patch import (
     hf_437_prepare_inputs_for_generation, _prepare_decoder_attention_mask_inference, 
-    forward_llama_model, forward_llama_for_causal_lm
+    # forward_llama_model, 
+    forward_llama_for_causal_lm
 )
 
-from minfer_ops import vs_attn_forward, bs_attn_forward, streaming_forward
+from minfer_ops import (
+    vs_attn_forward, vs_attn_forward_v2,
+    bs_attn_forward, streaming_forward
+)
 from phi3 import Phi3ForCausalLM, Phi3Attention as PhiAttention, apply_rotary_pos_emb, repeat_kv, _get_unpad_data
 
 if is_flash_attn_2_available():
@@ -68,170 +71,6 @@ def rmsnorm_fwd(self, hidden_states):
         variance = hidden_states.pow(2).mean(-1, keepdim=True)
         hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
         return self.weight * hidden_states.to(input_dtype)
-
-
-_flash_supports_window_size = False
-class NNScalerPhiFlashAttention2(PhiAttention):
-    """
-    Llama flash attention module. This module inherits from `LlamaAttention` as the weights of the module stays
-    untouched. The only required change would be on the forward pass where it needs to correctly call the public API of
-    flash attention and deal with padding tokens in case the input contains any of them.
-    """
-
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-
-        # TODO: Should be removed once Flash Attention for RoCm is bumped to 2.1.
-        # flash_attn<2.1 generates top-left aligned causal mask, while what is needed here is bottom-right alignement, that was made default for flash_attn>=2.1. This attribute is used to handle this difference. Reference: https://github.com/Dao-AILab/flash-attention/releases/tag/v2.1.0.
-        # Beware that with flash_attn<2.1, using q_seqlen != k_seqlen (except for the case q_seqlen == 1) produces a wrong mask (top-left).
-        self._flash_attn_uses_top_left_mask = not is_flash_attn_greater_or_equal_2_10()
-
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        attention_mask: Optional[torch.LongTensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        past_key_value: Optional[Cache] = None,
-        output_attentions: bool = False,
-        use_cache: bool = False,
-        **kwargs,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
-        # Phi3FlashAttention2 attention does not support output_attentions
-        output_attentions = False
-
-        if "padding_mask" in kwargs:
-            warnings.warn(
-                "Passing `padding_mask` is deprecated and will be removed in v4.37. Please make sure use `attention_mask` instead.`"
-            )
-
-            # overwrite attention_mask with padding_mask
-            attention_mask = kwargs.pop("padding_mask")
-
-        bsz, q_len, _ = hidden_states.size()
-
-        qkv = self.qkv_proj(hidden_states)
-        query_pos = self.num_heads * self.head_dim
-        query_states = qkv[..., :query_pos]
-        key_states = qkv[..., query_pos : query_pos + self.num_key_value_heads * self.head_dim]
-        value_states = qkv[..., query_pos + self.num_key_value_heads * self.head_dim :]
-
-        # Flash attention requires the input to have the shape
-        # batch_size x seq_length x head_dim x hidden_dim
-        # therefore we just need to keep the original shape
-        query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
-        key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
-        value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
-
-        kv_seq_len = key_states.shape[-2]
-        if past_key_value is not None:
-            if self.layer_idx is None:
-                raise ValueError(
-                    f"The cache structure has changed since version v4.36. If you are using {self.__class__.__name__} "
-                    "for auto-regressive decoding with k/v caching, please make sure to initialize the attention class "
-                    "with a layer index."
-                )
-            kv_seq_len += past_key_value.get_usable_length(kv_seq_len, self.layer_idx)
-
-        # Because the input can be padded, the absolute sequence length depends on the max position id.
-        rotary_seq_len = max(kv_seq_len, position_ids[:, -1].max().item()) + 1
-        cos, sin = self.rotary_emb(value_states, position_ids, seq_len=rotary_seq_len)
-
-        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
-
-        use_sliding_windows = (
-            _flash_supports_window_size
-            and getattr(self.config, "sliding_window", None) is not None
-            and kv_seq_len > self.config.sliding_window
-        )
-
-        if past_key_value is not None:
-            # Activate slicing cache only if the config has a value `sliding_windows` attribute
-            cache_has_contents = past_key_value.get_seq_length(self.layer_idx) > 0
-            if (
-                getattr(self.config, "sliding_window", None) is not None
-                and kv_seq_len > self.config.sliding_window
-                and cache_has_contents
-            ):
-                slicing_tokens = 1 - self.config.sliding_window
-
-                past_key = past_key_value[self.layer_idx][0]
-                past_value = past_key_value[self.layer_idx][1]
-
-                past_key = past_key[:, :, slicing_tokens:, :].contiguous()
-                past_value = past_value[:, :, slicing_tokens:, :].contiguous()
-
-                if past_key.shape[-2] != self.config.sliding_window - 1:
-                    raise ValueError(
-                        f"past key must have a shape of (`batch_size, num_heads, self.config.sliding_window-1, head_dim`), got"
-                        f" {past_key.shape}"
-                    )
-
-                if attention_mask is not None:
-                    attention_mask = attention_mask[:, slicing_tokens:]
-                    attention_mask = torch.cat([attention_mask, torch.ones_like(attention_mask[:, -1:])], dim=-1)
-
-            cache_kwargs = {"sin": sin, "cos": cos}  # Specific to RoPE models
-            key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
-
-        # repeat k/v heads if n_kv_heads < n_heads
-        key_states = repeat_kv(key_states, self.num_key_value_groups)
-        value_states = repeat_kv(value_states, self.num_key_value_groups)
-
-        attn_dropout = self.attention_dropout if self.training else 0.0
-
-        # In PEFT, usually we cast the layer norms in float32 for training stability reasons
-        # therefore the input hidden states gets silently casted in float32. Hence, we need
-        # cast them back in the correct dtype just to be sure everything works as expected.
-        # This might slowdown training & inference so it is recommended to not cast the LayerNorms
-        # in fp32.
-
-        if query_states.dtype == torch.float32:
-            if torch.is_autocast_enabled():
-                target_dtype = torch.get_autocast_gpu_dtype()
-            # Handle the case where the model is quantized
-            elif hasattr(self.config, "_pre_quantization_dtype"):
-                target_dtype = self.config._pre_quantization_dtype
-            else:
-                target_dtype = self.qkv_proj.weight.dtype
-
-            logger.warning_once(
-                f"The input hidden states seems to be silently casted in float32, this might be related to"
-                f" the fact you have upcasted embedding or layer norm layers in float32. We will cast back the input in"
-                f" {target_dtype}."
-            )
-
-            query_states = query_states.to(target_dtype)
-            key_states = key_states.to(target_dtype)
-            value_states = value_states.to(target_dtype)
-
-        # Reashape to the expected shape for Flash Attention
-        query_states = query_states.transpose(1, 2)
-        key_states = key_states.transpose(1, 2)
-        value_states = value_states.transpose(1, 2)
-
-        if not self._flash_attn_uses_top_left_mask:
-            causal = self.is_causal
-        else:
-            # TODO: Remove the `query_length != 1` check once Flash Attention for RoCm is bumped to 2.1. For details, please see the comment in LlamaFlashAttention2 __init__.
-            causal = self.is_causal and q_len != 1
-
-        attn_output = nnscaler_flash_attention_forward(
-            query_states,
-            key_states,
-            value_states,
-            attention_mask,
-            q_len,
-            dropout=attn_dropout,
-            causal=causal,
-        )
-
-        attn_output = attn_output.reshape(bsz, q_len, self.hidden_size).contiguous()
-        attn_output = self.o_proj(attn_output)
-
-        if not output_attentions:
-            attn_weights = None
-
-        return attn_output, attn_weights, past_key_value
 
 
 def nnscaler_flash_attention_forward(
@@ -399,6 +238,228 @@ def init_minference_parameters(self):
     # import apply_rotary_pos_emb
     self.apply_rotary_pos_emb = True
 
+def forward_phi_decoder_layer(
+    self,
+    hidden_states: torch.Tensor,
+    attention_mask: Optional[torch.Tensor] = None,
+    position_ids: Optional[torch.LongTensor] = None,
+    past_key_value: Optional[Tuple[torch.Tensor]] = None,
+    output_attentions: Optional[bool] = False,
+    use_cache: Optional[bool] = False,
+    padding_mask: Optional[torch.LongTensor] = None,
+) -> Tuple[torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]]:
+    """
+    Args:
+        hidden_states (`torch.FloatTensor`): input to the layer of shape `(batch, seq_len, embed_dim)`
+        attention_mask (`torch.FloatTensor`, *optional*): attention mask of size
+            `(batch, 1, tgt_len, src_len)` where padding elements are indicated by very large negative values.
+        output_attentions (`bool`, *optional*):
+            Whether or not to return the attentions tensors of all attention layers. See `attentions` under
+            returned tensors for more detail.
+        use_cache (`bool`, *optional*):
+            If set to `True`, `past_key_values` key value states are returned and can be used to speed up decoding
+            (see `past_key_values`).
+        past_key_value (`Tuple(torch.FloatTensor)`, *optional*): cached past key and value projection states
+    """
+    # original procedure: 
+    # residual -> input_layernorm -> self_attn -> self_attn + residual 
+    # -> residual -> post_attention_layernorm -> mlp -> mlp + residual
+
+    residual = hidden_states.clone()
+
+    hidden_states = self.input_layernorm(hidden_states)
+
+    # Self Attention
+    hidden_states, self_attn_weights, present_key_value = self.self_attn(
+        hidden_states=hidden_states,
+        attention_mask=attention_mask,
+        position_ids=position_ids,
+        past_key_value=past_key_value,
+        output_attentions=output_attentions,
+        use_cache=use_cache,
+        padding_mask=padding_mask,
+    )
+    if residual.device != hidden_states.device:
+        residual = residual.to(hidden_states.device)
+    hidden_states = residual + hidden_states
+
+    # Fully Connected
+    # # TODO: Here the post_attention_layernorm, mlp and residual addition are done in 32000-token chunks
+    # for start_idx in range(0, seq_len, 32000):
+    #     end_idx = min(seq_len, start_idx + 32000)
+    #     part_hidden_states = hidden_states[:, start_idx:end_idx, :].clone() # residual clone 
+    #     part_hidden_states = self.post_attention_layernorm(part_hidden_states)
+    #     part_hidden_states = self.mlp(part_hidden_states)
+    #     hidden_states[:, start_idx:end_idx, :] += part_hidden_states # residual addition
+    residual = hidden_states
+    hidden_states = self.post_attention_layernorm(hidden_states)
+    hidden_states = self.mlp(hidden_states)
+    hidden_states = residual + hidden_states
+
+
+    outputs = (hidden_states,)
+    if output_attentions:
+        outputs += (self_attn_weights,)
+
+    if use_cache:
+        outputs += (present_key_value,)
+
+    return outputs
+
+from transformers.cache_utils import *
+from transformers.models.llama.modeling_llama import *
+def forward_phi_model(
+    self,
+    input_ids: torch.LongTensor = None,
+    attention_mask: Optional[torch.Tensor] = None,
+    position_ids: Optional[torch.LongTensor] = None,
+    past_key_values: Optional[List[torch.FloatTensor]] = None,
+    inputs_embeds: Optional[torch.FloatTensor] = None,
+    use_cache: Optional[bool] = None,
+    output_attentions: Optional[bool] = None,
+    output_hidden_states: Optional[bool] = None,
+    return_dict: Optional[bool] = None,
+) -> Union[Tuple, BaseModelOutputWithPast]:
+    output_attentions = (
+        output_attentions
+        if output_attentions is not None
+        else self.config.output_attentions
+    )
+    output_hidden_states = (
+        output_hidden_states
+        if output_hidden_states is not None
+        else self.config.output_hidden_states
+    )
+    use_cache = use_cache if use_cache is not None else self.config.use_cache
+
+    return_dict = (
+        return_dict if return_dict is not None else self.config.use_return_dict
+    )
+
+    # retrieve input_ids and inputs_embeds
+    if input_ids is not None and inputs_embeds is not None:
+        raise ValueError(
+            "You cannot specify both input_ids and inputs_embeds at the same time"
+        )
+    elif input_ids is not None:
+        batch_size, seq_length = input_ids.shape[:2]
+    elif inputs_embeds is not None:
+        batch_size, seq_length = inputs_embeds.shape[:2]
+    else:
+        raise ValueError("You have to specify either input_ids or inputs_embeds")
+
+    if self.gradient_checkpointing and self.training:
+        if use_cache:
+            logger.warning_once(
+                "`use_cache=True` is incompatible with gradient checkpointing. Setting `use_cache=False`..."
+            )
+            use_cache = False
+
+    seq_length_with_past = seq_length
+    past_key_values_length = 0
+
+    if use_cache:
+        use_legacy_cache = not isinstance(past_key_values, Cache)
+        if use_legacy_cache:
+            past_key_values = DynamicCache.from_legacy_cache(past_key_values)
+        past_key_values_length = past_key_values.get_usable_length(seq_length)
+        seq_length_with_past = seq_length_with_past + past_key_values_length
+
+    if position_ids is None:
+        device = input_ids.device if input_ids is not None else inputs_embeds.device
+        position_ids = torch.arange(
+            past_key_values_length,
+            seq_length + past_key_values_length,
+            dtype=torch.long,
+            device=device,
+        )
+        position_ids = position_ids.unsqueeze(0)
+
+    if inputs_embeds is None:
+        inputs_embeds = self.embed_tokens(input_ids)
+
+    if attention_mask is None:
+        attention_mask = torch.ones(
+            (batch_size, seq_length_with_past),
+            dtype=torch.bool,
+            device=inputs_embeds.device,
+        )
+
+    attention_mask = self._prepare_decoder_attention_mask(
+        attention_mask, (batch_size, seq_length), inputs_embeds, past_key_values_length
+    )
+
+    # embed positions
+    hidden_states = inputs_embeds
+
+    # decoder layers
+    all_hidden_states = () if output_hidden_states else None
+    all_self_attns = () if output_attentions else None
+    next_decoder_cache = None
+
+    for decoder_layer in self.layers:
+        if output_hidden_states:
+            all_hidden_states = all_hidden_states + (hidden_states,)
+
+        if self.gradient_checkpointing and self.training:
+            layer_outputs = self._gradient_checkpointing_func(
+                decoder_layer.__call__,
+                hidden_states,
+                attention_mask,
+                position_ids,
+                past_key_values,
+                output_attentions,
+                use_cache,
+            )
+        else:
+            layer_outputs = decoder_layer(
+                hidden_states,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_value=past_key_values,
+                output_attentions=output_attentions,
+                use_cache=use_cache,
+            )
+
+        hidden_states = layer_outputs[0]
+
+        if use_cache:
+            next_decoder_cache = layer_outputs[2 if output_attentions else 1]
+
+        if output_attentions:
+            all_self_attns += (layer_outputs[1],)
+
+    # batch, seq_len, embed_dim = hidden_states.shape
+    # for start_idx in range(0, seq_len, 32000):
+    #     end_idx = min(seq_len, start_idx + 32000)
+    #     hidden_states[:, start_idx:end_idx, :] = self.norm(
+    #         hidden_states[:, start_idx:end_idx, :]
+    #     )
+    hidden_states = self.norm(hidden_states)
+
+    # add hidden states from the last decoder layer
+    if output_hidden_states:
+        all_hidden_states = all_hidden_states + (hidden_states,)
+
+    next_cache = None
+    if use_cache:
+        next_cache = (
+            next_decoder_cache.to_legacy_cache()
+            if use_legacy_cache
+            else next_decoder_cache
+        )
+    if not return_dict:
+        return tuple(
+            v
+            for v in [hidden_states, next_cache, all_hidden_states, all_self_attns]
+            if v is not None
+        )
+    return BaseModelOutputWithPast(
+        last_hidden_state=hidden_states,
+        past_key_values=next_cache,
+        hidden_states=all_hidden_states,
+        attentions=all_self_attns,
+    )
 
 
 def minference_forward():
@@ -477,52 +538,53 @@ def minference_forward():
             config = {}
             print("Layer", self.layer_idx)
 
+        with torch.autograd.set_detect_anomaly(True):
+            if q_len != 1:
+                # output = torch.empty_like(query_states)
+                output_list = []
+                for head in range(query_states.size(1)):
+                    q = query_states[:, head, :, :].unsqueeze(1) # (bsz, 1, q_len, head_dim)
+                    k = key_states[:, head, :, :].unsqueeze(1)
+                    v = value_states[:, head, :, :].unsqueeze(1)
 
-        if q_len != 1:
-            output = torch.empty_like(query_states)
-            for head in range(query_states.size(1)):
-                q = query_states[:, head, :, :].unsqueeze(1) # (bsz, 1, q_len, head_dim)
-                k = key_states[:, head, :, :].unsqueeze(1)
-                v = value_states[:, head, :, :].unsqueeze(1)
+                    # If search mode is enabled and the current layer has not already been configured 
+                    # => search for the best pattern
+                    if self.is_search and self.layer_idx >= len(config_list):
+                        with torch.no_grad():
+                            config[head] = search_pattern(q, k, head)
 
-                # If search mode is enabled and the current layer has not already been configured 
-                # => search for the best pattern
-                if self.is_search and self.layer_idx >= len(config_list):
-                    with torch.no_grad():
-                        config[head] = search_pattern(q, k, head)
-
-                # if search is disabled and the current layer is beyond  starting layer 
-                # => apply the kernel for calculating the attention based on the best pattern
-                if self.layer_idx >= self.starting_layer and not self.is_search:
-                    attn_output = self.minfer_attn_forward(q, k, v, head)
-                elif is_flash_attn_2_available(): 
-                    # if search is enabled or the current layer is before the starting layer, simply use flash attention 
-                    # Note that the input to the flash attention function should be in the shape (bsz, q_len, head_dim, num_heads)
-                    attn_output = nnscaler_flash_attention_forward(
-                        q.transpose(1, 2), k.transpose(1, 2), v.transpose(1,2),
-                        attention_mask, q_len, 
-                        dropout=0.0, softmax_scale=None, causal=q_len != 1
-                    )
-                    attn_output = attn_output.view(bsz, 1, q_len, self.head_dim)
-                else:
-                    attn_output = gather_qkv(q, k, v, attention_mask)
-
-                output[:, head:head + 1] = attn_output
-            if self.is_search:
-                if len(config):
-                    config_list.append(config)
-                with open(self.config_path, 'w') as json_file:
-                    json.dump(config_list, json_file)
-        else:
-            output =  flash_attn_func(
-                query_states.transpose(1, 2), 
-                key_states.transpose(1, 2), 
-                value_states.transpose(1,2), 
-                0.0, softmax_scale=None, causal=q_len != 1
-            ).view(bsz, query_states.size(1), q_len, self.head_dim)
-        attn_output = output.transpose(1, 2).contiguous()
-        attn_output = attn_output.reshape(bsz, q_len, self.num_heads * self.head_dim)
-        attn_output = self.o_proj(attn_output)
+                    # if search is disabled and the current layer is beyond  starting layer 
+                    # => apply the kernel for calculating the attention based on the best pattern
+                    if self.layer_idx >= self.starting_layer and not self.is_search:
+                        attn_output_head = self.minfer_attn_forward(q, k, v, head)
+                    elif is_flash_attn_2_available(): 
+                        # if search is enabled or the current layer is before the starting layer, simply use flash attention 
+                        # Note that the input to the flash attention function should be in the shape (bsz, q_len, head_dim, num_heads)
+                        attn_output_head = nnscaler_flash_attention_forward(
+                            q.transpose(1, 2), k.transpose(1, 2), v.transpose(1,2),
+                            attention_mask, q_len, 
+                            dropout=0.0, softmax_scale=None, causal=q_len != 1
+                        )
+                        attn_output_head = attn_output_head.view(bsz, 1, q_len, self.head_dim)
+                    else:
+                        attn_output_head = gather_qkv(q, k, v, attention_mask)
+                    output_list.append(attn_output_head.squeeze(1))
+                output = torch.stack(output_list, dim=1)
+                if self.is_search:
+                    if len(config):
+                        config_list.append(config)
+                    with open(self.config_path, 'w') as json_file:
+                        json.dump(config_list, json_file)
+            else:
+                output =  flash_attn_func(
+                    query_states.transpose(1, 2), 
+                    key_states.transpose(1, 2), 
+                    value_states.transpose(1,2), 
+                    0.0, softmax_scale=None, causal=q_len != 1
+                ).view(bsz, query_states.size(1), q_len, self.head_dim)
+            attn_output = output.transpose(1, 2).contiguous()
+            attn_output = attn_output.reshape(bsz, q_len, self.num_heads * self.head_dim)
+            attn_output = self.o_proj(attn_output)
 
         return attn_output, None, past_key_value
 
@@ -552,33 +614,10 @@ def minfer_attn_forward(self, q, k, v, head_id):
             dropout=0.0, softmax_scale=None, causal=q_len != 1
         )
         return attn_output.view(bsz, 1, q_len, self.head_dim)
-
+    
     def vertical_and_slash_kernel(q: torch.Tensor, k, v, vertical_size, slash_size):
-        vertical_size, slash_size  = min(q_len, max(vertical_size, 30)), min(q_len, max(slash_size, 50))
-
-        last_q = min(64, q_len)
-
-        with torch.no_grad():
-            # qk = torch.einsum(f'bhmk, bhnk -> bhmn', q[:,:,-last_q:,:], k) / math.sqrt(self.head_dim)
-            qk = qk_einsum(q[:,:,-last_q:,:].clone().detach(), k, self.head_dim)
-
-            # LAST_Q_MASK: torch.Size([1, 1, 64, 64])
-            # qk[:, :, :, -last_q:] = torch.where(LAST_Q_MASK[...,-last_q:,-last_q:].to(q.device), qk[:, :, :, -last_q:], -torch.inf)
-            last_q_mask = LAST_Q_MASK[..., -last_q:, -last_q:]
-            qk[:, :, :, -last_q:] = torch.where(last_q_mask, qk[:, :, :, -last_q:], -torch.inf)
-
-            vertical = qk.sum(-2, keepdim=True)
-            vertical[..., :30] = torch.inf
-            vertical_topk = torch.topk(vertical, vertical_size, -1).indices
-
-            slash = sum_all_diagonal_matrix(qk)[...,:-last_q + 1]
-            slash[..., -100:] = torch.inf
-            slash = (q_len - 1) - torch.topk(slash, slash_size, -1).indices
-
-        # return vertical_slash_sparse_attention(q, k, v, vertical_topk, slash)
-        return vs_attn_forward(q, k, v, vertical_topk, slash)
-    
-    
+        return vs_attn_forward_v2(q, k, v, q_len, vertical_size, slash_size, self.head_dim)
+                        
     def block_sparse_kernel(q, k, v, vertical_size=None, slash_size=None):
         topk = 100
         # return block_sparse_attention(q, k, v, topk)
@@ -630,7 +669,7 @@ def minfer_phi_init(model: Phi3ForCausalLM, model_id: str, minfer_config: MInfer
             )
             m.forward = forward.__get__(m, Attention)
         if isinstance(m, DecoderLayer):
-            m.forward = forward_llama_decoder_layer.__get__(m, DecoderLayer)
+            m.forward = forward_phi_decoder_layer.__get__(m, DecoderLayer)
     
     model.apply(update_module)
     model.prepare_inputs_for_generation = hf_437_prepare_inputs_for_generation.__get__(
@@ -643,7 +682,7 @@ def minfer_phi_init(model: Phi3ForCausalLM, model_id: str, minfer_config: MInfer
             model.model, model.model.__class__
         )
     )
-    model.model.forward = forward_llama_model.__get__(
+    model.model.forward = forward_phi_model.__get__(
         model.model, model.model.__class__
     )
     model.forward = forward_llama_for_causal_lm.__get__(model, model.__class__)

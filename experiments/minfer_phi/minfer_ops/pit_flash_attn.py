@@ -1,15 +1,20 @@
-import minference.ops
-import minference.ops.pit_sparse_flash_attention_v2
-import torch
-from nnscaler.graph.parser.register import register_op
 import math
-
 import torch
+import numpy as np
+
 import triton
 import triton.language as tl
 
 import minference
+import minference.ops
+import minference.ops.pit_sparse_flash_attention_v2
 from minference.cuda import convert_vertical_slash_indexes
+from minference.modules.minference_forward import (
+    LAST_Q_MASK, sum_all_diagonal_matrix
+)
+
+
+from nnscaler.graph.parser.register import register_op
 
 # @triton.autotune(
 #    configs=[
@@ -96,7 +101,7 @@ def _triton_mixed_sparse_attn_fwd_kernel(
         qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
         causal_mask = cols[None, :] <= offs_m[:, None]
         qk = tl.where(m_mask & causal_mask, qk, float("-inf"))
-        qk += tl.dot(q, k)
+        qk = qk + tl.dot(q, k)
 
         # -- compute scaling constant --
         m_i_new = tl.maximum(m_i, tl.max(qk, 1))
@@ -105,8 +110,8 @@ def _triton_mixed_sparse_attn_fwd_kernel(
 
         # -- scale and update acc --
         acc_scale = l_i * 0 + alpha  # workaround some compiler bug
-        acc *= acc_scale[:, None]
-        acc += tl.dot(p.to(dtype), v)
+        acc = acc * acc_scale[:, None]
+        acc = acc + tl.dot(p.to(dtype), v)
 
         # -- update m_i and l_i --
         l_i = l_i * alpha + tl.sum(p, 1)
@@ -121,24 +126,24 @@ def _triton_mixed_sparse_attn_fwd_kernel(
         # -- compute qk --
         qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
         qk = tl.where(m_mask & n_mask, qk, float("-inf"))
-        qk += tl.dot(q, k)
+        qk = qk + tl.dot(q, k)
         # -- compute scaling constant --
         m_i_new = tl.maximum(m_i, tl.max(qk, 1))
         alpha = tl.math.exp2(m_i - m_i_new)
         p = tl.math.exp2(qk - m_i_new[:, None])
         # -- scale and update acc --
         acc_scale = l_i * 0 + alpha  # workaround some compiler bug
-        acc *= acc_scale[:, None]
-        acc += tl.dot(p.to(dtype), v)
+        acc = acc * acc_scale[:, None]
+        acc = acc + tl.dot(p.to(dtype), v)
+
         # -- update m_i and l_i --
         l_i = l_i * alpha + tl.sum(p, 1)
         m_i = m_i_new
 
     # write back O
-    acc /= l_i[:, None]
+    acc = acc / l_i[:, None]
     # acc = tl.where(m_mask, acc / l_i[:, None], 0.0)
     tl.store(o_ptrs, acc.to(dtype), mask=m_mask)
-
 
 def _triton_mixed_sparse_attention(
     q: torch.Tensor,          # [BATCH, N_HEADS, N_CTX, D_HEAD]
@@ -192,30 +197,25 @@ def vertical_slash_sparse_attention(
     query = torch.nn.functional.pad(query, [0, 0, 0, pad, 0, 0, 0, 0])
     key = torch.nn.functional.pad(key, [0, 0, 0, pad, 0, 0, 0, 0])
     value = torch.nn.functional.pad(value, [0, 0, 0, pad, 0, 0, 0, 0])
-    print(f'query.dtype: {query.dtype}')
-    print(f'key.dtype: {key.dtype}')
-    print(f'value.dtype: {value.dtype}')
 
     if head_dim not in [16, 32, 64, 128, 256, 512]:
         target_dim = 2 ** math.ceil(math.log2(head_dim)) - head_dim
         query = torch.nn.functional.pad(query, [0, target_dim, 0, 0, 0, 0, 0, 0])
         key = torch.nn.functional.pad(key, [0, target_dim, 0, 0, 0, 0, 0, 0])
         value = torch.nn.functional.pad(value, [0, target_dim, 0, 0, 0, 0, 0, 0])
-
+    sm_scale = head_dim ** -0.5
 
     with torch.no_grad():
         v_idx = v_idx.to(torch.int32).reshape((batch_size, num_heads, -1)).sort(dim=-1, descending=False)[0]
         s_idx = s_idx.to(torch.int32).reshape((batch_size, num_heads, -1)).sort(dim=-1, descending=True)[0]
         seqlens = torch.tensor([context_size], dtype=torch.int32, device=query.device)
-        sm_scale = head_dim ** -0.5
+        
 
-        print("Sign 207")
-        torch.cuda.synchronize()
+        # torch.cuda.synchronize()
         block_count, block_offset, column_count, column_index = convert_vertical_slash_indexes(
             seqlens, v_idx, s_idx, context_size, block_size_M, block_size_N,
         )
-        torch.cuda.synchronize()
-        print("Sign 212")
+        # torch.cuda.synchronize()
 
     out = _triton_mixed_sparse_attention(
         query, key, value, seqlens,
@@ -240,4 +240,92 @@ class CustomVSSAttention(torch.autograd.Function):
 def vs_attn_forward(q, k, v, vertical_topk, slash):
     return CustomVSSAttention.apply(q, k, v, vertical_topk, slash)
 
+
+def vertical_slash_sparse_attention_v2(
+    query: torch.Tensor,  # [BATCH, N_HEADS, N_CTX, D_HEAD]
+    key: torch.Tensor,    # [BATCH, N_HEADS, N_CTX, D_HEAD]
+    value: torch.Tensor,  # [BATCH, N_HEADS, N_CTX, D_HEAD]
+    block_count: torch.Tensor,  # [BATCH, N_HEADS, cdiv(N_CTX, BLOCK_SIZE_M)]
+    block_offset: torch.Tensor,  # [BATCH, N_HEADS, cdiv(N_CTX, BLOCK_SIZE_M), NNZ_S]
+    column_count: torch.Tensor,  # [BATCH, N_HEADS, cdiv(N_CTX, BLOCK_SIZE_M)]
+    column_index: torch.Tensor,  # [BATCH, N_HEADS, cdiv(N_CTX, BLOCK_SIZE_M), NNZ_V]
+    block_size_M: int = 64,
+    block_size_N: int = 64,
+):
+    batch_size, num_heads, context_size, head_dim = query.shape
+    pad = block_size_M - (context_size & (block_size_M - 1))
+    query = torch.nn.functional.pad(query, [0, 0, 0, pad, 0, 0, 0, 0])
+    key = torch.nn.functional.pad(key, [0, 0, 0, pad, 0, 0, 0, 0])
+    value = torch.nn.functional.pad(value, [0, 0, 0, pad, 0, 0, 0, 0])
+
+    if head_dim not in [16, 32, 64, 128, 256, 512]:
+        target_dim = 2 ** math.ceil(math.log2(head_dim)) - head_dim
+        query = torch.nn.functional.pad(query, [0, target_dim, 0, 0, 0, 0, 0, 0])
+        key = torch.nn.functional.pad(key, [0, target_dim, 0, 0, 0, 0, 0, 0])
+        value = torch.nn.functional.pad(value, [0, target_dim, 0, 0, 0, 0, 0, 0])
+    sm_scale = head_dim ** -0.5
+    seqlens = torch.tensor([context_size], dtype=torch.int32, device=query.device).detach()
+    
+    out = _triton_mixed_sparse_attention(
+        query, key, value, seqlens,
+        block_count, block_offset, column_count, column_index,
+        sm_scale, block_size_M, block_size_N,
+    )
+    return out[..., :context_size, :head_dim]
+
+
+class CustomVSSAttentionV2(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, q, k, v, block_count, block_offset, column_count, column_index):
+        ctx.save_for_backward(q, k, v, block_count, block_offset, column_count, column_index)
+        return vertical_slash_sparse_attention_v2(q, k, v, block_count, block_offset, column_count, column_index)
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        # TODO: Implement backward pass
+        return grad_output.clone(), grad_output.clone(), grad_output.clone(), None, None, None, None
+
+
+def vs_attn_forward_v2(
+    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, 
+    q_len: int, vertical_size: int, slash_size: int, head_dim: int,
+    block_size_M: int = 64,
+    block_size_N: int = 64,
+):
+    batch_size, num_heads, context_size, head_dim = q.shape
+
+    vertical_size, slash_size  = min(q_len, max(vertical_size, 30)), min(q_len, max(slash_size, 50))
+    last_q = min(64, q_len)
+
+    with torch.no_grad():
+        qk = torch.einsum(
+            f'bhmk, bhnk -> bhmn', 
+            q[:,:,-last_q:,:].clone().detach(), 
+            k.clone().detach(),
+        ) / math.sqrt(head_dim)
+
+        # LAST_Q_MASK: torch.Size([1, 1, 64, 64])
+        # qk[:, :, :, -last_q:] = torch.where(LAST_Q_MASK[...,-last_q:,-last_q:].to(q.device), qk[:, :, :, -last_q:], -torch.inf)
+        last_q_mask = LAST_Q_MASK[..., -last_q:, -last_q:].clone().detach()
+        qk[:, :, :, -last_q:] = torch.where(last_q_mask.to(q.device), qk[:, :, :, -last_q:], -torch.inf)
+
+        vertical = qk.sum(-2, keepdim=True)
+        vertical[..., :30] = torch.inf
+        vertical_topk = torch.topk(vertical, vertical_size, -1).indices
+
+        slash = sum_all_diagonal_matrix(qk)[...,:-last_q + 1]
+        slash[..., -100:] = torch.inf
+        slash_indices = torch.topk(slash, slash_size, -1).indices
+        slash_indices = (q_len - 1) - slash_indices
+
+        v_idx = vertical_topk.to(torch.int32).reshape((batch_size, num_heads, -1)).sort(dim=-1, descending=False)[0]
+        s_idx = slash_indices.to(torch.int32).reshape((batch_size, num_heads, -1)).sort(dim=-1, descending=True)[0]
+        seqlens = torch.tensor([context_size], dtype=torch.int32, device=q.device)
+
+        block_count, block_offset, column_count, column_index = convert_vertical_slash_indexes(
+            seqlens, v_idx, s_idx, context_size, block_size_M, block_size_N,
+        )
+
+    return CustomVSSAttentionV2.apply(q, k, v, block_count, block_offset, column_count, column_index)
+
 register_op('b num_head^ l^ hd^, b num_head^ l^ hd^, b num_head^ l^ hd^ -> b num_head^ l^ hd^')(vs_attn_forward)
+register_op('b num_head^ l^ hd^, b num_head^ l^ hd^, b num_head^ l^ hd^ -> b num_head^ l^ hd^')(vs_attn_forward_v2)
