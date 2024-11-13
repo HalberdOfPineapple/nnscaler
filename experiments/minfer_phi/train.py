@@ -10,8 +10,8 @@ from typing import Dict
 from datasets import load_from_disk
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer, DataCollatorForLanguageModeling
 
-from minference import MInference
-from minference.minference_configuration import MInferenceConfig
+# from minference import MInference
+# from minference.minference_configuration import MInferenceConfig
 
 from nnscaler.utils import set_default_logger_level
 from nnscaler.cli.trainer_args import (
@@ -32,6 +32,7 @@ from nnscaler.cli.loggers.tensorboard import TensorBoardLogger
 
 from phi3 import Phi3ForCausalLM
 from minfer_modifier import minfer_phi_init
+from minfer_modules import ExprMInferConfig as MInferenceConfig, ExprMInference as MInference
 from chunk_linear_cross_entropy import chunk_linear_cross_entropy
 from custom_trainer import CustomTrainer as Trainer # from nnscaler.cli.trainer import Trainer
 
@@ -312,7 +313,7 @@ def main(args):
     trainer_args = TrainerArgs(
         global_batch_size=args.global_batch_size,
         micro_batch_size=args.micro_batch_size,
-        grad_accumulation_steps=args.global_batch_size // args.micro_batch_size,
+        grad_accumulation_steps=args.global_batch_size // (args.micro_batch_size * scaling_factor),
 
         pas_policy='autodist',
         precision='bf16',

@@ -28,6 +28,8 @@ from transformers.utils import (
     is_flash_attn_greater_or_equal_2_10,
     logging,
 )
+from transformers.models.llama.modeling_llama import *
+from transformers.cache_utils import *
 from transformers.cache_utils import Cache
 
 
@@ -46,8 +48,9 @@ from minference.patch import (
 )
 
 from minfer_ops import (
-    vs_attn_forward, vs_attn_forward_v2,
-    bs_attn_forward, streaming_forward
+    vs_attn_forward,
+    bs_attn_forward, 
+    streaming_forward
 )
 from phi3 import Phi3ForCausalLM, Phi3Attention as PhiAttention, apply_rotary_pos_emb, repeat_kv, _get_unpad_data
 
@@ -196,27 +199,8 @@ def phi_flash_attention_anno(query_states, key_states, value_states, attention_m
         return f'b l^ {q_anno} hd^, b s^ {kv_anno} hd^, b s^ {kv_anno} vd^, b l^ -> b l^ {q_anno} vd^'
     else:
         return f'b l^ {q_anno} hd^, b s^ {kv_anno} hd^, b s^ {kv_anno} vd^ -> b l^ {q_anno} vd^'
-
-
 register_op(phi_flash_attention_anno)(nnscaler_flash_attention_forward)
 
-# ROPE_TYPE = None
-# def set_rope_type(self):
-#     global ROPE_TYPE
-#     if ROPE_TYPE is not None:
-#         return
-#     if "seq_len" in inspect.signature(self.rotary_emb.forward).parameters:
-#         if "position_ids" in inspect.signature(self.rotary_emb.forward).parameters:
-#             ROPE_TYPE = "seq_len,position_ids"
-#         else:
-#             ROPE_TYPE = "seq_len"
-#     elif "max_seq_len" in inspect.signature(self.rotary_emb.forward).parameters:
-#         ROPE_TYPE = "max_seq_len"
-#     else:
-#         ROPE_TYPE = "position_ids"
-# def get_rope_type():
-#     from minference.modules.minference_forward import ROPE_TYPE
-#     return ROPE_TYPE
 
 def init_minference_parameters(self):
     config = self.config.to_dict()
@@ -306,8 +290,8 @@ def forward_phi_decoder_layer(
 
     return outputs
 
-from transformers.cache_utils import *
-from transformers.models.llama.modeling_llama import *
+
+
 def forward_phi_model(
     self,
     input_ids: torch.LongTensor = None,
@@ -616,7 +600,7 @@ def minfer_attn_forward(self, q, k, v, head_id):
         return attn_output.view(bsz, 1, q_len, self.head_dim)
     
     def vertical_and_slash_kernel(q: torch.Tensor, k, v, vertical_size, slash_size):
-        return vs_attn_forward_v2(q, k, v, q_len, vertical_size, slash_size, self.head_dim)
+        return vs_attn_forward(q, k, v, q_len, vertical_size, slash_size, self.head_dim)
                         
     def block_sparse_kernel(q, k, v, vertical_size=None, slash_size=None):
         topk = 100
@@ -629,9 +613,9 @@ def minfer_attn_forward(self, q, k, v, head_id):
     ty, vertical_size, slash_size, _ = self.best_pattern.get(head_id, ("vertical_and_slash", 1000, 6096, 1))
 
     # TODO: DEBUG Setting
-    if ty == 'stream_llm':
-        ty = 'vertical_and_slash'
-        vertical_size, slash_size = 1000, 6096
+    # if ty == 'stream_llm':
+    #     ty = 'vertical_and_slash'
+    #     vertical_size, slash_size = 1000, 6096
 
     fc = {
         "stream_llm": streaming_forward,
