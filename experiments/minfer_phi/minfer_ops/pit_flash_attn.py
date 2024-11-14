@@ -204,7 +204,11 @@ def _triton_mixed_sparse_attention(
     dtype = tl.bfloat16 if q.dtype == torch.bfloat16 else tl.float16
 
     # auto softmax_lse = torch::empty({batch_size, num_heads, seqlen_q}, opts.dtype(at::kFloat));
-    softmax_lse = torch.zeros((q.shape[0], q.shape[1], q.shape[2]), dtype=q.dtype, device=q.device)
+    softmax_lse = torch.zeros(
+        (q.shape[0], q.shape[1], q.shape[2]), 
+        dtype=torch.float32, # Noet that the dtype must be float32 instead of float16
+        device=q.device
+    )
 
     _triton_mixed_sparse_attn_fwd_kernel[grid](
         q, k, v, seqlens, sm_scale,
@@ -226,28 +230,6 @@ def _triton_mixed_sparse_attention(
 
     return o, softmax_lse
 
-def vertical_slash_sparse_attention(
-    query: torch.Tensor,  # [BATCH, N_HEADS, N_CTX, D_HEAD]
-    key: torch.Tensor,    # [BATCH, N_HEADS, N_CTX, D_HEAD]
-    value: torch.Tensor,  # [BATCH, N_HEADS, N_CTX, D_HEAD]
-    block_count: torch.Tensor,  # [BATCH, N_HEADS, cdiv(N_CTX, BLOCK_SIZE_M)]
-    block_offset: torch.Tensor,  # [BATCH, N_HEADS, cdiv(N_CTX, BLOCK_SIZE_M), NNZ_S]
-    column_count: torch.Tensor,  # [BATCH, N_HEADS, cdiv(N_CTX, BLOCK_SIZE_M)]
-    column_index: torch.Tensor,  # [BATCH, N_HEADS, cdiv(N_CTX, BLOCK_SIZE_M), NNZ_V]
-    seqlens: torch.Tensor,
-    sm_scale: float,
-    block_size_M: int = 64,
-    block_size_N: int = 64,
-):
-    out, softmax_lse = _triton_mixed_sparse_attention(
-        query, key, value, seqlens,
-        block_count, block_offset, column_count, column_index,
-        sm_scale, block_size_M, block_size_N,
-    )
-    # return out[..., :context_size, :head_dim], softmax_lse[..., :context_size]
-    return out, softmax_lse
-
-
 class VSSAttention(torch.autograd.Function):
     @staticmethod
     def forward(
@@ -256,6 +238,7 @@ class VSSAttention(torch.autograd.Function):
         block_count, block_offset, column_count, column_index,
         seqlens: torch.Tensor,
         block_size_M: int = 64,
+        block_size_N: int = 64,
     ):
         _, _, context_size, head_dim = query.shape
         ctx.context_size = context_size
@@ -280,10 +263,10 @@ class VSSAttention(torch.autograd.Function):
         # the input version of Q, K and V are padded to be divisible by BLOCK_SIZE_M
         # the output and softmax_lse are also padded
         sm_scale = head_dim ** -0.5
-        o, softmax_lse = vertical_slash_sparse_attention(
-            query, key, value, 
+        o, softmax_lse = _triton_mixed_sparse_attention(
+            query, key, value, seqlens,
             block_count, block_offset, column_count, column_index,
-            seqlens, sm_scale
+            sm_scale, block_size_M, block_size_N,
         )
         ctx.save_for_backward(query, key, value, o, softmax_lse)
 
@@ -309,8 +292,6 @@ class VSSAttention(torch.autograd.Function):
         if head_dim < q.shape[-1]:
             grad_output = torch.nn.functional.pad(grad_output, [0, q.shape[-1] - head_dim, 0, 0, 0, 0, 0, 0])
 
-        # torch.cuda.synchronize()
-        # print("Starting backward pass..", end=" ")
         _flash_attn_backward(
             grad_output, 
             q, k, v, o, softmax_lse, 
@@ -323,10 +304,8 @@ class VSSAttention(torch.autograd.Function):
             deterministic=False,
             rng_state=None,
         )
-        # print("Done.")
-        # torch.cuda.synchronize()
-
         return dq[..., :context_size, :head_dim], dk[..., :context_size, :head_dim], dv[..., :context_size, :head_dim], None, None, None, None, None
+        
         # return grad_output[..., :context_size, :head_dim].clone(), grad_output[..., :context_size, :head_dim].clone(), grad_output[..., :context_size, :head_dim].clone(), None, None, None, None, None
 
 
@@ -334,7 +313,7 @@ class VSSAttentionV2(torch.autograd.Function):
     @staticmethod
     def forward(ctx, q, k, v, block_count, block_offset, column_count, column_index):
         ctx.save_for_backward(q, k, v, block_count, block_offset, column_count, column_index)
-        return vertical_slash_sparse_attention(q, k, v, block_count, block_offset, column_count, column_index)
+        raise NotImplementedError("VSSAttentionV2 is not implemented yet.")
     @staticmethod
     def backward(ctx, grad_output: torch.Tensor):
         # TODO: Implement backward pass (with sparse)
