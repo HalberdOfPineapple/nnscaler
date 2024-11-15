@@ -36,7 +36,6 @@ from transformers.cache_utils import Cache
 from minference import MInference
 from minference.minference_configuration import MInferenceConfig
 from minference.modules.minference_forward import (
-    # init_minference_parameters, 
     get_cos_sin, search_pattern, gather_qkv,
     LAST_Q_MASK, sum_all_diagonal_matrix
 )

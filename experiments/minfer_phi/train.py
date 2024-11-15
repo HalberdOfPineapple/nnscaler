@@ -30,7 +30,7 @@ from nnscaler.parallel import ComputeConfig, BroadcastGenFilesStrategy
 from nnscaler.runtime.f16_optimizer import MixedPrecisionAdamW
 from nnscaler.cli.loggers.tensorboard import TensorBoardLogger
 
-from phi3 import Phi3ForCausalLM
+# from modeling_modifier import nnscaler_phi_init
 from minfer_modifier import minfer_phi_init
 from minfer_modules import ExprMInferConfig as MInferenceConfig, ExprMInference as MInference
 from chunk_linear_cross_entropy import chunk_linear_cross_entropy
@@ -42,6 +42,20 @@ logger = logging.getLogger(__name__)
 IGNORE_IDX = -100
 MINFER_CONFIG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'configs')
 
+
+# define a enumerate class for MInfer type
+class MInferType:
+    BASELINE: str = "baseline"
+    MF_DB: str = "mf_db"
+    DF_MB: str = "df_mb"
+    MF_MB: str = "mf_mb"
+
+
+def nnscaler_phi_init(attn_type: str='flash', attn_save_path: str=None):
+    from phi3 import PHI3_ATTENTION_CLASSES
+    from modeling_modifier import NNScalerPhiFlashAttention2
+    
+    PHI3_ATTENTION_CLASSES["flash_attention_2"] = NNScalerPhiFlashAttention2
 
 def get_tokenizer(tokenizer_name_or_path,
                   model_max_length=None,
@@ -108,22 +122,46 @@ def minfer_patch_setup(model, minfer_config: MInferenceConfig):
         )
     return model
 
-
-class WrapperModel(torch.nn.Module):
-    def __init__(self, model_id, config_path: str=None, minfer_config: Dict={}):
+class BaselineModel(torch.nn.Module):
+    def __init__(self, model_id, config_path: str=None):
         super().__init__()
-        
+        from phi3 import Phi3ForCausalLM
+
         if not config_path:
             self.model = Phi3ForCausalLM.from_pretrained(
-                model_id, 
+                model_id,
+                attn_implementation='flash_attention_2'
             )
         else:
             model_config = AutoConfig.from_pretrained(config_path, trust_remote_code=True)
+            model_config._attn_implementation = 'flash_attention_2'
             self.model = Phi3ForCausalLM.from_pretrained(
                 model_id,
                 config=model_config,
             )
-        
+            
+        print(f'{__name__} BaselineModel Selt-Attention Class: {self.model.model.layers[0].self_attn.__class__.__name__}')
+
+    def forward(self, samples):
+        with torch.autocast(device_type="cuda", dtype=self.model.config.torch_dtype):
+            outputs = self.model.model(
+                input_ids=samples['net_input']['src_tokens'],
+                use_cache=False,
+                return_dict=False,
+            )
+            hidden_states = outputs[0]
+            losses = chunk_linear_cross_entropy(hidden_states, self.model.lm_head.weight, samples['target'], IGNORE_IDX, 1024)
+            loss = torch.sum(losses)
+
+        return loss, loss.data, samples['ntokens'], samples['nsentences']
+
+class MInferModel(BaselineModel):
+    def __init__(self, model_id, config_path: str=None, minfer_config: Dict={}):
+        super().__init__(
+            model_id=model_id,
+            config_path=config_path
+        )
+
         minfer_attn_type = minfer_config.pop('attn_type', 'minference')
         minfer = MInference(
             attn_type=minfer_attn_type,
@@ -134,19 +172,6 @@ class WrapperModel(torch.nn.Module):
         
         self.model = minfer_patch_setup(self.model, minfer_config)
         self.model = minfer_phi_init(self.model, model_id, minfer_config)
-        
-
-    def forward(self, samples):
-        outputs = self.model.model(
-            input_ids=samples['net_input']['src_tokens'],
-            use_cache=False,
-            return_dict=False,
-        )
-        hidden_states = outputs[0]
-        losses = chunk_linear_cross_entropy(hidden_states, self.model.lm_head.weight, samples['target'], IGNORE_IDX, 1024)
-        loss = torch.sum(losses)
-
-        return loss, loss.data, samples['ntokens'], samples['nsentences']
 
 
 def aggregate_outputs_fn(loss_outputs, sync_group) -> AggregatedOutputs:
@@ -180,6 +205,10 @@ def main(args):
     #     debugpy.listen(("0.0.0.0", port))
     #     print(f"Waiting for debugger attach on rank {os.environ['LOCAL_RANK']} (port {port})...")
     #     debugpy.wait_for_client()
+
+    if args.minfer_type == MInferType.BASELINE:
+        print(f"{__name__} | Using Baseline Model...")
+        nnscaler_phi_init()
 
     minfer_config_path = os.path.join(MINFER_CONFIG_DIR, f'{args.name}.yaml')
     if not os.path.exists(minfer_config_path):
@@ -252,13 +281,14 @@ def main(args):
         },
     )
 
+    model_args = {
+        'model_id': args.model_id,
+        'config_path': args.model_config_path,
+    }
+    if args.minfer_type != 'baseline': model_args['minfer_config'] = minfer_config
     model_config = ModelConfig(
-        type=WrapperModel,
-        args={
-            'model_id': args.model_id,
-            'config_path': args.model_config_path,
-            'minfer_config': minfer_config,
-        },
+        type=MInferModel if args.minfer_type != 'baseline' else BaselineModel,
+        args=model_args,
     )
 
     # optimizer hyperparameters are from YaRN
@@ -296,7 +326,8 @@ def main(args):
 
     checkpoint_config = CheckpointConfig(
         save_dir=args.ckpt_save_dir if args.ckpt_save_dir else f'./checkpoints_{args.name}',
-        every_n_epochs=1,
+        every_n_epochs=args.ckpt_n_epoch,
+        every_n_train_steps=args.ckpt_n_step,
         save_type='deduped',
         resume_from=(args.ckpt_save_dir or 'last') if args.check_resume else None,
     )
@@ -341,7 +372,7 @@ def main(args):
 
     trainer = Trainer(
         train_args=trainer_args,
-        save_data_steps=args.save_step,
+        save_data_steps=args.attn_save_step,
     )
     trainer.run()
 
@@ -355,13 +386,19 @@ def print_args(args: argparse.Namespace):
     print(f"Model ID:\t{args.model_id}")
 
     print('-' * 40)
-    print(f"Number of Iterations:\t{args.n_iter}")
-    print(f"Number of Epochs:\t{args.n_epochs}")
+    if args.n_iter:
+        print(f"Number of Iterations:\t{args.n_iter}")
+    else:
+        print(f"Number of Epochs:\t{args.n_epochs}")
+
     print(f'Global Batch Size:\t{args.global_batch_size}')
     print(f'Micro Batch Size:\t{args.micro_batch_size}')
-    print(f"Scaling Factor (INFERRED):\t{args.runtime_ngpus // args.plan_ngpus}")
-    print(f"Gradient Accumulation Steps (INFERRED):\t{args.global_batch_size // args.micro_batch_size}")
-    print(f"Save Attention Data Every {args.save_step} Steps")
+
+    scaling_factor = args.runtime_ngpus // args.plan_ngpus
+    grad_accu_step = args.global_batch_size // (args.micro_batch_size * scaling_factor)
+    print(f"Scaling Factor (INFERRED):\t{scaling_factor}")
+    print(f"Gradient Accumulation Steps (INFERRED):\t{grad_accu_step}")
+    print(f"Save Attention Data Every {args.attn_save_step} Steps")
 
     print('-' * 40)
     print(f'MInferenece Config Path:\t{args.minfer_config_path}')
@@ -370,6 +407,10 @@ def print_args(args: argparse.Namespace):
     print(f"Tensorboard Log Path:\t{args.tf_log_dir}")
     print(f"Checkpoint Save Path:\t{args.ckpt_save_dir}")
     print(f"Resume from Checkpoint:\t{args.check_resume}")
+    if args.ckpt_n_step:
+        print(f"Checkpoint Save Every {args.ckpt_n_step} Steps")
+    else:
+        print(f"Checkpoint Save Every {args.ckpt_n_epoch} Epochs")
     print("=" * 80)
 
 if __name__ == '__main__':
@@ -377,32 +418,42 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     
     parser.add_argument('--name', type=str, default='phi-grad', help='name of the experiment')
+    parser.add_argument('--minfer_type', type=str, default=MInferType.BASELINE, choices=MInferType.__dict__.values(), help='minference type')
     parser.add_argument('--reuse_type', type=str, default='match', choices=['match', 'override', 'moo', 'graph'], help='reuse type')
     parser.add_argument('--run_mode', type=str, default='run', choices=['run', 'compile'], help='run or compile')
     parser.add_argument('--plan_ngpus', type=int, required=True, help='specify the scale unit size')
     parser.add_argument('--runtime_ngpus', type=int, required=True, help='specify the number of GPUs to use')
     
-    parser.add_argument('--n_iter', type=int, default=None, help='Number of iterations')
-    parser.add_argument('--n_epochs', type=int, default=None, help='Number of epochs')
+    parser.add_argument('--n_iter', type=int, default=0, help='Number of iterations')
+    parser.add_argument('--n_epochs', type=int, default=0, help='Number of epochs')
     parser.add_argument('--global_batch_size', type=int, default=4, help='global batch size')
     parser.add_argument('--micro_batch_size', type=int, default=1, help='micro batch size')
 
     parser.add_argument('--model_id', type=str, default='microsoft/Phi-3-mini-4k-instruct', help='transformers model id')
     parser.add_argument('--model_config_path', type=str, default=None, help='path to the model config')
-    parser.add_argument('-s', '--save_step', type=int, default=1, help='Save attention data every n steps')
+    parser.add_argument('-s', '--attn_save_step', type=int, default=1, help='Save attention data every n steps')
 
     parser.add_argument('--minfer_config_path', type=str, default=None, help='path to minference config')
     parser.add_argument('--compile_save_path', type=str, default='./.nnscaler', help='path to save compiled code')
     parser.add_argument('--attn_save_path', type=str, default=None, help='path to save attention data')
     parser.add_argument('--tf_log_dir', type=str, default=None, help='path to save tensorboard logs')
-    parser.add_argument('--ckpt_save_dir', type=str, default=None, help='path to save checkpoints')
     parser.add_argument('--dataset_path', type=str, default=None, help='path to the dataset')
     parser.add_argument('--check_resume', action='store_true', help='whether to resume from checkpoint')
+
+    parser.add_argument('--ckpt_save_dir', type=str, default=None, help='path to save checkpoints')
+    parser.add_argument('--ckpt_n_epoch', type=int, default=1, help='save checkpoint every n epochs')
+    parser.add_argument('--ckpt_n_step', type=int, default=0, help='save checkpoint every n steps')
 
     parser.add_argument('-p', '--disable_progressbar',action='store_true',help='transformers model id',)
 
     args = parser.parse_args()
     print_args(args)
+
+    if args.ckpt_n_epoch <= 0: args.ckpt_n_epoch = None
+    if args.ckpt_n_step <= 0: args.ckpt_n_step = None
+
+    if args.n_iter <= 0: args.n_iter = None
+    if args.n_epochs <= 0: args.n_epochs = None
 
     main(args)
 
