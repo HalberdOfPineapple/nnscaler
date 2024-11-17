@@ -5,7 +5,7 @@ from minference.minference_configuration import MInferenceConfig
 CONFIG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'configs')
 EXPR_MODEL2PATH = {
     "microsoft/Phi-3-mini-4k-instruct": os.path.join(
-        CONFIG_DIR, "Phi_3_mini_128k_instruct_kv_out_v32_fit_o_best_pattern.json"
+        CONFIG_DIR, "Phi-3-mini-4k-instruct-LongRoPE-128k.json"
     ),
 }
 
