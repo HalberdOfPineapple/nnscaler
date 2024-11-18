@@ -206,7 +206,7 @@ def _triton_mixed_sparse_attention(
     # auto softmax_lse = torch::empty({batch_size, num_heads, seqlen_q}, opts.dtype(at::kFloat));
     softmax_lse = torch.zeros(
         (q.shape[0], q.shape[1], q.shape[2]), 
-        dtype=torch.float32, # Noet that the dtype must be float32 instead of float16
+        dtype=torch.float32, # Note that the dtype must be float32 instead of float16
         device=q.device
     )
 
@@ -231,110 +231,110 @@ def _triton_mixed_sparse_attention(
     return o, softmax_lse
 
 
-@triton.jit
-def _triton_mixed_sparse_attn_bwd_kernel(
-    Q, K, V, seqlens,
-    block_count, block_offset, column_count, column_index,
-    O, DO, softmax_lse, D,
-    stride_qz, stride_qh, stride_qm, stride_qk,
-    stride_kz, stride_kh, stride_kn, stride_kk,
-    stride_vz, stride_vh, stride_vn, stride_vk,
-    stride_oz, stride_oh, stride_om, stride_ok,
-    stride_doz, stride_doh, stride_dom, stride_dok,
-    stride_sz, stride_sh, stride_sm,
-    Z, H, N_CTX, # (BATCH, N_HEADS, N_CTX)
-    NUM_ROWS, NNZ_S, NNZ_V,
-    BLOCK_M: tl.constexpr,
-    BLOCK_N: tl.constexpr,
-    BLOCK_DMODEL: tl.constexpr,
-):
-    start_n = tl.program_id(0)
-    off_hz = tl.program_id(1)
-    seqlen = tl.load(seqlens + off_hz // H)
+# @triton.jit
+# def _triton_mixed_sparse_attn_bwd_kernel(
+#     Q, K, V, seqlens,
+#     block_count, block_offset, column_count, column_index,
+#     O, DO, softmax_lse, D,
+#     stride_qz, stride_qh, stride_qm, stride_qk,
+#     stride_kz, stride_kh, stride_kn, stride_kk,
+#     stride_vz, stride_vh, stride_vn, stride_vk,
+#     stride_oz, stride_oh, stride_om, stride_ok,
+#     stride_doz, stride_doh, stride_dom, stride_dok,
+#     stride_sz, stride_sh, stride_sm,
+#     Z, H, N_CTX, # (BATCH, N_HEADS, N_CTX)
+#     NUM_ROWS, NNZ_S, NNZ_V,
+#     BLOCK_M: tl.constexpr,
+#     BLOCK_N: tl.constexpr,
+#     BLOCK_DMODEL: tl.constexpr,
+# ):
+#     start_n = tl.program_id(0)
+#     off_hz = tl.program_id(1)
+#     seqlen = tl.load(seqlens + off_hz // H)
 
-    # initialize offsets
-    offs_m = tl.arange(0, BLOCK_M)
-    offs_n = start_n * BLOCK_N +tl.arange(0, BLOCK_N)
-    offs_d = tl.arange(0, BLOCK_DMODEL)
+#     # initialize offsets
+#     offs_m = tl.arange(0, BLOCK_M)
+#     offs_n = start_n * BLOCK_N +tl.arange(0, BLOCK_N)
+#     offs_d = tl.arange(0, BLOCK_DMODEL)
 
-    # (off_hz // H) -> batch index, (off_hz // H) * stride_qz -> batch offset in Q 
-    # (off_hz % H) -> head index, (off_hz % H) * stride_qh -> head offset in Q
-    qo_offset = (off_hz // H) * stride_qz + (off_hz % H) * stride_qh
-    kv_offset = (off_hz // H) * stride_kz + (off_hz % H) * stride_kh
+#     # (off_hz // H) -> batch index, (off_hz // H) * stride_qz -> batch offset in Q 
+#     # (off_hz % H) -> head index, (off_hz % H) * stride_qh -> head offset in Q
+#     qo_offset = (off_hz // H) * stride_qz + (off_hz % H) * stride_qh
+#     kv_offset = (off_hz // H) * stride_kz + (off_hz % H) * stride_kh
 
-    # offs_m[:, None]: [BLOCK_M, 1], offs_m[:, None] * stride_qm: offsets for m in Q, offs_d[None, :]: offsets for d in Q
-    # Note that for sequence length dimension, the slice is [:, None] while for the head dimension, the slice is [None, :]
-    # the sum of these two slices is [BLOCK_M, BLOCK_DMODEL] -> representing the offsets for each index in the last two dimensions
-    q_ptrs = Q + qo_offset + offs_d[None, :] * stride_qk
+#     # offs_m[:, None]: [BLOCK_M, 1], offs_m[:, None] * stride_qm: offsets for m in Q, offs_d[None, :]: offsets for d in Q
+#     # Note that for sequence length dimension, the slice is [:, None] while for the head dimension, the slice is [None, :]
+#     # the sum of these two slices is [BLOCK_M, BLOCK_DMODEL] -> representing the offsets for each index in the last two dimensions
+#     q_ptrs = Q + qo_offset + offs_d[None, :] * stride_qk
 
-    # the offsets for k and v are the same as q, they do not need to be offset by the sequence length dimension (to be moved in the loop)
-    k_ptrs = K + kv_offset + offs_n[None, :] * stride_kn + offs_d[:, None] * stride_kk
-    v_ptrs = V + kv_offset + offs_n[None, :] * stride_kn + offs_d[None, :] * stride_vk
-    o_ptrs = Out + qo_offset + offs_m[:, None] * stride_om + offs_d[None, :] * stride_ok
+#     # the offsets for k and v are the same as q, they do not need to be offset by the sequence length dimension (to be moved in the loop)
+#     k_ptrs = K + kv_offset + offs_n[None, :] * stride_kn + offs_d[:, None] * stride_kk
+#     v_ptrs = V + kv_offset + offs_n[None, :] * stride_kn + offs_d[None, :] * stride_vk
+#     o_ptrs = Out + qo_offset + offs_m[:, None] * stride_om + offs_d[None, :] * stride_ok
 
-    num_blks = tl.load(block_count + off_hz * NUM_ROWS + start_m) # load the number of non-sparse blocks
-    blks_ptr = block_offset + (off_hz * NUM_ROWS + start_m) * NNZ_S # pointer to the start of the list of non-sparse blocks
+#     num_blks = tl.load(block_count + off_hz * NUM_ROWS + start_m) # load the number of non-sparse blocks
+#     blks_ptr = block_offset + (off_hz * NUM_ROWS + start_m) * NNZ_S # pointer to the start of the list of non-sparse blocks
     
-    num_cols = tl.load(column_count + off_hz * NUM_ROWS + start_m) # load the number of non-sparse column(block)s
-    cols_ptr = column_index + (off_hz * NUM_ROWS + start_m) * NNZ_V 
+#     num_cols = tl.load(column_count + off_hz * NUM_ROWS + start_m) # load the number of non-sparse column(block)s
+#     cols_ptr = column_index + (off_hz * NUM_ROWS + start_m) * NNZ_V 
     
 
-def _triton_mixed_sparse_attention_bwd(
-    q: torch.Tensor,          # [BATCH, N_HEADS, N_CTX, D_HEAD]
-    k: torch.Tensor,          # [BATCH, N_HEADS, N_CTX, D_HEAD]
-    v: torch.Tensor,          # [BATCH, N_HEADS, N_CTX, D_HEAD]
-    o: torch.Tensor,          # [BATCH, N_HEADS, N_CTX, D_HEAD]
-    do: torch.Tensor,         # [BATCH, N_HEADS, N_CTX, D_HEAD]
-    softmax_lse: torch.Tensor, # [BATCH, N_HEADS, N_CTX]
-    seqlens: torch.Tensor,    # [BATCH, ]
-    block_count: torch.Tensor,  # [BATCH, N_HEADS, cdiv(N_CTX, BLOCK_SIZE_M)]
-    block_offset: torch.Tensor,  # [BATCH, N_HEADS, cdiv(N_CTX, BLOCK_SIZE_M), NNZ_S]
-    column_count: torch.Tensor,  # [BATCH, N_HEADS, cdiv(N_CTX, BLOCK_SIZE_M)]
-    column_index: torch.Tensor,  # [BATCH, N_HEADS, cdiv(N_CTX, BLOCK_SIZE_M), NNZ_V]
-    block_size_M: int = 64,
-    block_size_N: int = 64,
-) -> torch.Tensor:
-    # shape constraints
-    Lq, Lk, Lv = q.shape[-1], k.shape[-1], v.shape[-1]
-    assert Lq == Lk and Lk == Lv
-    assert Lk in {16, 32, 64, 128}
+# def _triton_mixed_sparse_attention_bwd(
+#     q: torch.Tensor,          # [BATCH, N_HEADS, N_CTX, D_HEAD]
+#     k: torch.Tensor,          # [BATCH, N_HEADS, N_CTX, D_HEAD]
+#     v: torch.Tensor,          # [BATCH, N_HEADS, N_CTX, D_HEAD]
+#     o: torch.Tensor,          # [BATCH, N_HEADS, N_CTX, D_HEAD]
+#     do: torch.Tensor,         # [BATCH, N_HEADS, N_CTX, D_HEAD]
+#     softmax_lse: torch.Tensor, # [BATCH, N_HEADS, N_CTX]
+#     seqlens: torch.Tensor,    # [BATCH, ]
+#     block_count: torch.Tensor,  # [BATCH, N_HEADS, cdiv(N_CTX, BLOCK_SIZE_M)]
+#     block_offset: torch.Tensor,  # [BATCH, N_HEADS, cdiv(N_CTX, BLOCK_SIZE_M), NNZ_S]
+#     column_count: torch.Tensor,  # [BATCH, N_HEADS, cdiv(N_CTX, BLOCK_SIZE_M)]
+#     column_index: torch.Tensor,  # [BATCH, N_HEADS, cdiv(N_CTX, BLOCK_SIZE_M), NNZ_V]
+#     block_size_M: int = 64,
+#     block_size_N: int = 64,
+# ) -> torch.Tensor:
+#     # shape constraints
+#     Lq, Lk, Lv = q.shape[-1], k.shape[-1], v.shape[-1]
+#     assert Lq == Lk and Lk == Lv
+#     assert Lk in {16, 32, 64, 128}
     
-    dq = torch.zeros_like(q, dtype=q.dtype, device=q.device)
-    dk = torch.zeros_like(k, dtype=k.dtype, device=k.device)
-    dv = torch.zeros_like(v, dtype=v.dtype, device=v.device)
+#     dq = torch.zeros_like(q, dtype=q.dtype, device=q.device)
+#     dk = torch.zeros_like(k, dtype=k.dtype, device=k.device)
+#     dv = torch.zeros_like(v, dtype=v.dtype, device=v.device)
 
-    D = torch.sum(do * o, dim=-1) # [BATCH, N_HEADS, N_CTX]
-
-
-    grid = (
-        triton.cdiv(k.shape[2], block_size_N), # Iterate by K and V
-        k.shape[0] * k.shape[1], 
-        1
-    )
-    dtype = tl.bfloat16 if q.dtype == torch.bfloat16 else tl.float16
+#     D = torch.sum(do * o, dim=-1) # [BATCH, N_HEADS, N_CTX]
 
 
-    _triton_mixed_sparse_attn_bwd_kernel[grid](
-        q, k, v, seqlens,
-        block_count, block_offset, column_count, column_index,
-        o, do, softmax_lse, D,
-        q.stride(0), q.stride(1), q.stride(2), q.stride(3),
-        k.stride(0), k.stride(1), k.stride(2), k.stride(3),
-        v.stride(0), v.stride(1), v.stride(2), v.stride(3),
-        o.stride(0), o.stride(1), o.stride(2), o.stride(3),
-        do.stride(0), do.stride(1), do.stride(2), do.stride(3),
-        softmax_lse.stride(0), softmax_lse.stride(1), softmax_lse.stride(2),
-        q.shape[0], q.shape[1], q.shape[2],
-        block_count.shape[-1], block_offset.shape[-1], column_index.shape[-1],
-        BLOCK_M=block_size_M, 
-        BLOCK_N=block_size_N,
-        BLOCK_DMODEL=Lk,
-        dtype=dtype,
-        num_warps=4, 
-        num_stages=2,
-    )
+#     grid = (
+#         triton.cdiv(k.shape[2], block_size_N), # Iterate by K and V
+#         k.shape[0] * k.shape[1], 
+#         1
+#     )
+#     dtype = tl.bfloat16 if q.dtype == torch.bfloat16 else tl.float16
 
-    return o, softmax_lse
+
+#     _triton_mixed_sparse_attn_bwd_kernel[grid](
+#         q, k, v, seqlens,
+#         block_count, block_offset, column_count, column_index,
+#         o, do, softmax_lse, D,
+#         q.stride(0), q.stride(1), q.stride(2), q.stride(3),
+#         k.stride(0), k.stride(1), k.stride(2), k.stride(3),
+#         v.stride(0), v.stride(1), v.stride(2), v.stride(3),
+#         o.stride(0), o.stride(1), o.stride(2), o.stride(3),
+#         do.stride(0), do.stride(1), do.stride(2), do.stride(3),
+#         softmax_lse.stride(0), softmax_lse.stride(1), softmax_lse.stride(2),
+#         q.shape[0], q.shape[1], q.shape[2],
+#         block_count.shape[-1], block_offset.shape[-1], column_index.shape[-1],
+#         BLOCK_M=block_size_M, 
+#         BLOCK_N=block_size_N,
+#         BLOCK_DMODEL=Lk,
+#         dtype=dtype,
+#         num_warps=4, 
+#         num_stages=2,
+#     )
+
+#     return o, softmax_lse
 
 class VSSAttention(torch.autograd.Function):
     @staticmethod
@@ -353,7 +353,8 @@ class VSSAttention(torch.autograd.Function):
         # Pad to context_length dimension (N_CTX) to be divisible by BLOCK_SIZE_M
         # torch.cuda.synchronize()
         # print("Starting padding QKV..", end=" ")
-        pad = block_size_M - (context_size & (block_size_M - 1))
+        print(f'Context size: {context_size}, head dim: {head_dim}')
+        pad = ((context_size + block_size_M - 1) // block_size_M) * block_size_M - context_size
         query = torch.nn.functional.pad(query, [0, 0, 0, pad, 0, 0, 0, 0])
         key = torch.nn.functional.pad(key, [0, 0, 0, pad, 0, 0, 0, 0])
         value = torch.nn.functional.pad(value, [0, 0, 0, pad, 0, 0, 0, 0])
@@ -374,7 +375,14 @@ class VSSAttention(torch.autograd.Function):
             block_count, block_offset, column_count, column_index,
             sm_scale, block_size_M, block_size_N,
         )
-        ctx.save_for_backward(query, key, value, o, softmax_lse)
+        # ctx.save_for_backward(query, key, value, o, softmax_lse)
+        ctx.save_for_backward(
+            query[..., :context_size, :head_dim].contiguous(), 
+            key[..., :context_size, :head_dim].contiguous(), 
+            value[..., :context_size, :head_dim].contiguous(), 
+            o[..., :context_size, :head_dim].contiguous(), 
+            softmax_lse[..., :context_size].contiguous()
+        )
 
         # return o
         return o[..., :context_size, :head_dim]
@@ -398,6 +406,17 @@ class VSSAttention(torch.autograd.Function):
         if head_dim < q.shape[-1]:
             grad_output = torch.nn.functional.pad(grad_output, [0, q.shape[-1] - head_dim, 0, 0, 0, 0, 0, 0])
 
+
+        torch.cuda.synchronize()
+        print(f"Q: shape={q.shape}, dtype={q.dtype}, device={q.device}")
+        print(f"K: shape={k.shape}, dtype={k.dtype}, device={k.device}")
+        print(f"V: shape={v.shape}, dtype={v.dtype}, device={v.device}")
+        print(f"O: shape={o.shape}, dtype={o.dtype}, device={o.device}")
+        print(f"softmax_lse: shape={softmax_lse.shape}, dtype={softmax_lse.dtype}, device={softmax_lse.device}")
+        print(f"grad_output: shape={grad_output.shape}, dtype={grad_output.dtype}, device={grad_output.device}")
+        print(f"dQ: shape={dq.shape}, dtype={dq.dtype}, device={dq.device}")
+        print(f"dK: shape={dk.shape}, dtype={dk.dtype}, device={dk.device}")
+        print(f"dV: shape={dv.shape}, dtype={dv.dtype}, device={dv.device}")
         _flash_attn_backward(
             grad_output, 
             q, k, v, o, softmax_lse, 
@@ -410,6 +429,8 @@ class VSSAttention(torch.autograd.Function):
             deterministic=False,
             rng_state=None,
         )
+        torch.cuda.synchronize()
+
         return dq[..., :context_size, :head_dim], dk[..., :context_size, :head_dim], dv[..., :context_size, :head_dim], None, None, None, None, None
         
         # return grad_output[..., :context_size, :head_dim].clone(), grad_output[..., :context_size, :head_dim].clone(), grad_output[..., :context_size, :head_dim].clone(), None, None, None, None, None
