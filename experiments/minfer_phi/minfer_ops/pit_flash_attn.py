@@ -5,9 +5,6 @@ import numpy as np
 import triton
 import triton.language as tl
 
-import minference
-import minference.ops
-import minference.ops.pit_sparse_flash_attention_v2
 from minference.cuda import convert_vertical_slash_indexes
 from minference.modules.minference_forward import (
     LAST_Q_MASK, sum_all_diagonal_matrix
@@ -39,7 +36,7 @@ def _triton_mixed_sparse_attn_fwd_kernel(
     block_offset, # [BATCH, N_HEADS, NUM_ROWS, NNZ_S], which refers to the start of the non-sparse K/V blocks to be computed with the corresponding Q block
     column_count, # [BATCH, N_HEADS, NUM_ROWS]
     column_index, # [BATCH, N_HEADS, NUM_ROWS, NNZ_V]
-    Out, # [BATCH, N_HEADS, N_CTX, D_HEAD]
+    Out, # [BATCH, N_CTX, N_HEADS, D_HEAD]
     softmax_lse, # [BATCH, N_HEADS, N_CTX]
     stride_qz, stride_qh, stride_qm, stride_qk,
     stride_kz, stride_kh, stride_kn, stride_kk,
@@ -176,15 +173,15 @@ def _triton_mixed_sparse_attn_fwd_kernel(
     softmax_lse_ptr = softmax_lse + offs_lse[:, None]
 
     # log(sum(exp(qk - m_i))) = log(sum(exp(qk)) * exp(-m_i)) = log(sum(exp(qk))) - m_i
-    softmax_lse_vals = tl.math.log(l_i) + m_i
+    softmax_lse_vals = (tl.math.log2(l_i) + m_i) / 1.44269504  # Remove it on MInference backward
 
     # directly use log because the scale has been applied to q, which makes values in softmax equivalent to exp(x/sqrt(d_model))
     tl.store(softmax_lse_ptr, softmax_lse_vals.to(dtype)[:, None], mask=m_mask) 
 
 def _triton_mixed_sparse_attention(
-    q: torch.Tensor,          # [BATCH, N_HEADS, N_CTX, D_HEAD]
-    k: torch.Tensor,          # [BATCH, N_HEADS, N_CTX, D_HEAD]
-    v: torch.Tensor,          # [BATCH, N_HEADS, N_CTX, D_HEAD]
+    q: torch.Tensor,          # [BATCH, N_CTX, N_HEADS, D_HEAD]
+    k: torch.Tensor,          # [BATCH, N_CTX, N_HEADS, D_HEAD]
+    v: torch.Tensor,          # [BATCH, N_CTX, N_HEADS, D_HEAD]
     seqlens: torch.Tensor,    # [BATCH, ]
     block_count: torch.Tensor,  # [BATCH, N_HEADS, cdiv(N_CTX, BLOCK_SIZE_M)]
     block_offset: torch.Tensor,  # [BATCH, N_HEADS, cdiv(N_CTX, BLOCK_SIZE_M), NNZ_S]
@@ -200,12 +197,12 @@ def _triton_mixed_sparse_attention(
     assert Lk in {16, 32, 64, 128}
     o = torch.zeros_like(q)
     
-    grid = (triton.cdiv(q.shape[2], block_size_M), q.shape[0] * q.shape[1], 1)
+    grid = (triton.cdiv(q.shape[1], block_size_M), q.shape[0] * q.shape[2], 1)
     dtype = tl.bfloat16 if q.dtype == torch.bfloat16 else tl.float16
 
     # auto softmax_lse = torch::empty({batch_size, num_heads, seqlen_q}, opts.dtype(at::kFloat));
     softmax_lse = torch.zeros(
-        (q.shape[0], q.shape[1], q.shape[2]), 
+        (q.shape[0], q.shape[2], q.shape[1]), 
         dtype=torch.float32, # Note that the dtype must be float32 instead of float16
         device=q.device
     )
@@ -215,12 +212,12 @@ def _triton_mixed_sparse_attention(
         block_count, block_offset, column_count, column_index,
         o,
         softmax_lse,
-        q.stride(0), q.stride(1), q.stride(2), q.stride(3),
-        k.stride(0), k.stride(1), k.stride(2), k.stride(3),
-        v.stride(0), v.stride(1), v.stride(2), v.stride(3),
-        o.stride(0), o.stride(1), o.stride(2), o.stride(3),
+        q.stride(0), q.stride(2), q.stride(1), q.stride(3),
+        k.stride(0), k.stride(2), k.stride(1), k.stride(3),
+        v.stride(0), v.stride(2), v.stride(1), v.stride(3),
+        o.stride(0), o.stride(2), o.stride(1), o.stride(3),
         softmax_lse.stride(0), softmax_lse.stride(1), softmax_lse.stride(2),
-        q.shape[0], q.shape[1], q.shape[2],
+        q.shape[0], q.shape[2], q.shape[1],
         block_count.shape[-1], block_offset.shape[-1], column_index.shape[-1],
         BLOCK_M=block_size_M, BLOCK_N=block_size_N,
         BLOCK_DMODEL=Lk,
@@ -280,11 +277,11 @@ def _triton_mixed_sparse_attention(
     
 
 # def _triton_mixed_sparse_attention_bwd(
-#     q: torch.Tensor,          # [BATCH, N_HEADS, N_CTX, D_HEAD]
-#     k: torch.Tensor,          # [BATCH, N_HEADS, N_CTX, D_HEAD]
-#     v: torch.Tensor,          # [BATCH, N_HEADS, N_CTX, D_HEAD]
-#     o: torch.Tensor,          # [BATCH, N_HEADS, N_CTX, D_HEAD]
-#     do: torch.Tensor,         # [BATCH, N_HEADS, N_CTX, D_HEAD]
+#     q: torch.Tensor,          # [BATCH, N_CTX, N_HEADS, D_HEAD]
+#     k: torch.Tensor,          # [BATCH, N_CTX, N_HEADS, D_HEAD]
+#     v: torch.Tensor,          # [BATCH, N_CTX, N_HEADS, D_HEAD]
+#     o: torch.Tensor,          # [BATCH, N_CTX, N_HEADS, D_HEAD]
+#     do: torch.Tensor,         # [BATCH, N_CTX, N_HEADS, D_HEAD]
 #     softmax_lse: torch.Tensor, # [BATCH, N_HEADS, N_CTX]
 #     seqlens: torch.Tensor,    # [BATCH, ]
 #     block_count: torch.Tensor,  # [BATCH, N_HEADS, cdiv(N_CTX, BLOCK_SIZE_M)]
@@ -307,8 +304,8 @@ def _triton_mixed_sparse_attention(
 
 
 #     grid = (
-#         triton.cdiv(k.shape[2], block_size_N), # Iterate by K and V
-#         k.shape[0] * k.shape[1], 
+#         triton.cdiv(k.shape[1], block_size_N), # Iterate by K and V
+#         k.shape[0] * k.shape[2], 
 #         1
 #     )
 #     dtype = tl.bfloat16 if q.dtype == torch.bfloat16 else tl.float16
@@ -318,13 +315,13 @@ def _triton_mixed_sparse_attention(
 #         q, k, v, seqlens,
 #         block_count, block_offset, column_count, column_index,
 #         o, do, softmax_lse, D,
-#         q.stride(0), q.stride(1), q.stride(2), q.stride(3),
-#         k.stride(0), k.stride(1), k.stride(2), k.stride(3),
-#         v.stride(0), v.stride(1), v.stride(2), v.stride(3),
-#         o.stride(0), o.stride(1), o.stride(2), o.stride(3),
+#         q.stride(0), q.stride(2), q.stride(1), q.stride(3),
+#         k.stride(0), k.stride(2), k.stride(1), k.stride(3),
+#         v.stride(0), v.stride(2), v.stride(1), v.stride(3),
+#         o.stride(0), o.stride(2), o.stride(1), o.stride(3),
 #         do.stride(0), do.stride(1), do.stride(2), do.stride(3),
 #         softmax_lse.stride(0), softmax_lse.stride(1), softmax_lse.stride(2),
-#         q.shape[0], q.shape[1], q.shape[2],
+#         q.shape[0], q.shape[2], q.shape[1],
 #         block_count.shape[-1], block_offset.shape[-1], column_index.shape[-1],
 #         BLOCK_M=block_size_M, 
 #         BLOCK_N=block_size_N,
@@ -346,7 +343,7 @@ class VSSAttention(torch.autograd.Function):
         block_size_M: int = 64,
         block_size_N: int = 64,
     ):
-        _, _, context_size, head_dim = query.shape
+        _, context_size, _, head_dim = query.shape
         ctx.context_size = context_size
         ctx.head_dim = head_dim
 
@@ -354,38 +351,27 @@ class VSSAttention(torch.autograd.Function):
         # torch.cuda.synchronize()
         # print("Starting padding QKV..", end=" ")
         print(f'Context size: {context_size}, head dim: {head_dim}')
-        pad = ((context_size + block_size_M - 1) // block_size_M) * block_size_M - context_size
-        query = torch.nn.functional.pad(query, [0, 0, 0, pad, 0, 0, 0, 0])
-        key = torch.nn.functional.pad(key, [0, 0, 0, pad, 0, 0, 0, 0])
-        value = torch.nn.functional.pad(value, [0, 0, 0, pad, 0, 0, 0, 0])
+        seq_pad = ((context_size + block_size_M - 1) // block_size_M) * block_size_M - context_size
+        dim_pad = 2 ** math.ceil(math.log2(head_dim)) - head_dim
+        query_pad = torch.nn.functional.pad(query, [0, dim_pad, 0, 0, 0, seq_pad, 0, 0])
+        key_pad = torch.nn.functional.pad(key, [0, dim_pad, 0, 0, 0, seq_pad, 0, 0])
+        value_pad = torch.nn.functional.pad(value, [0, dim_pad, 0, 0, 0, seq_pad, 0, 0])
         # print("Done.")
         # torch.cuda.synchronize()
-
-        if head_dim not in [16, 32, 64, 128, 256, 512]:
-            target_dim = 2 ** math.ceil(math.log2(head_dim)) - head_dim
-            query = torch.nn.functional.pad(query, [0, target_dim, 0, 0, 0, 0, 0, 0])
-            key = torch.nn.functional.pad(key, [0, target_dim, 0, 0, 0, 0, 0, 0])
-            value = torch.nn.functional.pad(value, [0, target_dim, 0, 0, 0, 0, 0, 0])
 
         # the input version of Q, K and V are padded to be divisible by BLOCK_SIZE_M
         # the output and softmax_lse are also padded
         sm_scale = head_dim ** -0.5
-        o, softmax_lse = _triton_mixed_sparse_attention(
-            query, key, value, seqlens,
+        o_pad, softmax_lse = _triton_mixed_sparse_attention(
+            query_pad, key_pad, value_pad, seqlens,
             block_count, block_offset, column_count, column_index,
             sm_scale, block_size_M, block_size_N,
         )
-        # ctx.save_for_backward(query, key, value, o, softmax_lse)
-        ctx.save_for_backward(
-            query[..., :context_size, :head_dim].contiguous(), 
-            key[..., :context_size, :head_dim].contiguous(), 
-            value[..., :context_size, :head_dim].contiguous(), 
-            o[..., :context_size, :head_dim].contiguous(), 
-            softmax_lse[..., :context_size].contiguous()
-        )
+        o = o_pad[:, :context_size, :, :head_dim]
 
-        # return o
-        return o[..., :context_size, :head_dim]
+        ctx.save_for_backward(query, key, value, o, softmax_lse[:, :, :context_size].contiguous())
+
+        return o
 
     @staticmethod
     def backward(ctx, grad_output: torch.Tensor):
@@ -400,23 +386,6 @@ class VSSAttention(torch.autograd.Function):
         q, k, v, o, softmax_lse = ctx.saved_tensors
         dq, dk, dv = torch.empty_like(q), torch.empty_like(k), torch.empty_like(v) 
 
-        # pad grad_output
-        if context_size < q.shape[-2]:
-            grad_output = torch.nn.functional.pad(grad_output, [0, 0, 0, q.shape[-2] - context_size, 0, 0, 0, 0])
-        if head_dim < q.shape[-1]:
-            grad_output = torch.nn.functional.pad(grad_output, [0, q.shape[-1] - head_dim, 0, 0, 0, 0, 0, 0])
-
-
-        torch.cuda.synchronize()
-        print(f"Q: shape={q.shape}, dtype={q.dtype}, device={q.device}")
-        print(f"K: shape={k.shape}, dtype={k.dtype}, device={k.device}")
-        print(f"V: shape={v.shape}, dtype={v.dtype}, device={v.device}")
-        print(f"O: shape={o.shape}, dtype={o.dtype}, device={o.device}")
-        print(f"softmax_lse: shape={softmax_lse.shape}, dtype={softmax_lse.dtype}, device={softmax_lse.device}")
-        print(f"grad_output: shape={grad_output.shape}, dtype={grad_output.dtype}, device={grad_output.device}")
-        print(f"dQ: shape={dq.shape}, dtype={dq.dtype}, device={dq.device}")
-        print(f"dK: shape={dk.shape}, dtype={dk.dtype}, device={dk.device}")
-        print(f"dV: shape={dv.shape}, dtype={dv.dtype}, device={dv.device}")
         _flash_attn_backward(
             grad_output, 
             q, k, v, o, softmax_lse, 
@@ -429,7 +398,6 @@ class VSSAttention(torch.autograd.Function):
             deterministic=False,
             rng_state=None,
         )
-        torch.cuda.synchronize()
 
         return dq[..., :context_size, :head_dim], dk[..., :context_size, :head_dim], dv[..., :context_size, :head_dim], None, None, None, None, None
         
@@ -454,22 +422,22 @@ def vs_attn_forward(
     block_size_M: int = 64,
     block_size_N: int = 64,
 ):
-    batch_size, num_heads, context_size, head_dim = q.shape
+    batch_size, context_size, num_heads, head_dim = q.shape
 
     vertical_size, slash_size  = min(q_len, max(vertical_size, 30)), min(q_len, max(slash_size, 50))
     last_q = min(64, q_len)
 
     with torch.no_grad():
         qk = torch.einsum(
-            f'bhmk, bhnk -> bhmn', 
-            q[:,:,-last_q:,:].clone().detach(), 
-            k.clone().detach(),
+            f'bmhk, bnhk -> bhmn', 
+            q[:, -last_q:, :, :].contiguous(), 
+            k,
         ) / math.sqrt(head_dim)
 
         # LAST_Q_MASK: torch.Size([1, 1, 64, 64])
         # qk[:, :, :, -last_q:] = torch.where(LAST_Q_MASK[...,-last_q:,-last_q:].to(q.device), qk[:, :, :, -last_q:], -torch.inf)
-        last_q_mask = LAST_Q_MASK[..., -last_q:, -last_q:].clone().detach()
-        qk[:, :, :, -last_q:] = torch.where(last_q_mask.to(q.device), qk[:, :, :, -last_q:], -torch.inf)
+        last_q_mask = LAST_Q_MASK[..., -last_q:, -last_q:].clone().to(q.device)
+        qk[:, :, :, -last_q:] = torch.where(last_q_mask, qk[:, :, :, -last_q:], -torch.inf)
 
         vertical = qk.sum(-2, keepdim=True)
         vertical[..., :30] = torch.inf
@@ -493,3 +461,40 @@ def vs_attn_forward(
     return VSSAttention.apply(q, k, v, block_count, block_offset, column_count, column_index, seqlens)
 
 register_op('b num_head^ l^ hd^, b num_head^ l^ hd^, b num_head^ l^ hd^ -> b num_head^ l^ hd^')(vs_attn_forward)
+
+
+if __name__ == '__main__':
+    context_size = 131072
+    q = torch.randn((1, context_size, 1, 96), dtype=torch.float16, device='cuda', requires_grad=True)
+    k = torch.randn((1, context_size, 1, 96), dtype=torch.float16, device='cuda', requires_grad=True)
+    v = torch.randn((1, context_size, 1, 96), dtype=torch.float16, device='cuda', requires_grad=True)
+
+    o = vs_attn_forward(q, k, v, context_size, 500, 131072, 96, 64, 64)
+    loss = torch.square(o).sum(dtype=torch.float64)
+    torch.cuda.synchronize()
+    loss.backward()
+    torch.cuda.synchronize()
+    
+    q_grad = q.grad.clone()
+    k_grad = k.grad.clone()
+    v_grad = v.grad.clone()
+    q.grad = None
+    k.grad = None
+    v.grad = None
+
+    from flash_attn import flash_attn_func
+    o_ref = flash_attn_func(
+        q,
+        k,
+        v,
+        dropout_p=0.0,
+        softmax_scale=None,
+        causal=True,
+    )
+    loss = torch.square(o_ref).sum(dtype=torch.float64)
+    loss.backward()
+    
+    torch.testing.assert_close(o, o_ref, atol=1e-2, rtol=1e-2)
+    torch.testing.assert_close(q_grad, q.grad, atol=1e-2, rtol=1e-2)
+    torch.testing.assert_close(k_grad, k.grad, atol=1e-2, rtol=1e-2)
+    torch.testing.assert_close(v_grad, v.grad, atol=1e-2, rtol=1e-2)

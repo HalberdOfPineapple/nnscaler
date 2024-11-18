@@ -599,7 +599,7 @@ def minfer_attn_forward(self, q, k, v, head_id):
         return attn_output.view(bsz, 1, q_len, self.head_dim)
     
     def vertical_and_slash_kernel(q: torch.Tensor, k, v, vertical_size, slash_size):
-        return vs_attn_forward(q, k, v, q_len, vertical_size, slash_size, self.head_dim)
+        return vs_attn_forward(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), q_len, vertical_size, slash_size, self.head_dim)
                         
     def block_sparse_kernel(q, k, v, vertical_size=None, slash_size=None):
         topk = 100
