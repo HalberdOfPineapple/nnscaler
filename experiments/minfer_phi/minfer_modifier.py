@@ -539,7 +539,7 @@ def minference_forward():
                     # if search is disabled and the current layer is beyond  starting layer 
                     # => apply the kernel for calculating the attention based on the best pattern
                     if self.layer_idx >= self.starting_layer and not self.is_search:
-                        attn_output_head = self.minfer_attn_forward(q, k, v, head)
+                        attn_output_head = self.minfer_attn_forward(q, k, v, head) # [bsz, 1, q_len, self.head_dim]
                     elif is_flash_attn_2_available(): 
                         # if search is enabled or the current layer is before the starting layer, simply use flash attention 
                         # Note that the input to the flash attention function should be in the shape (bsz, q_len, head_dim, num_heads)

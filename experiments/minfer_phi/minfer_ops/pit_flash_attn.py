@@ -417,7 +417,9 @@ class VSSAttentionV2(torch.autograd.Function):
 
 
 def vs_attn_forward(
-    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, 
+    q: torch.Tensor, # [BATCH, N_CTX, N_HEADS, D_HEAD]
+    k: torch.Tensor, # [BATCH, N_CTX, N_HEADS, D_HEAD]
+    v: torch.Tensor, # [BATCH, N_CTX, N_HEADS, D_HEAD]
     q_len: int, vertical_size: int, slash_size: int, head_dim: int,
     block_size_M: int = 64,
     block_size_N: int = 64,
@@ -430,13 +432,16 @@ def vs_attn_forward(
     with torch.no_grad():
         qk = torch.einsum(
             f'bmhk, bnhk -> bhmn', 
-            q[:, -last_q:, :, :].contiguous(), 
-            k,
-        ) / math.sqrt(head_dim)
+            q[:, -last_q:, :, :].contiguous(), # [BATCH, LAST_Q, N_HEADS, D_HEAD]
+            k, # [BATCH, N_CTX, N_HEADS, D_HEAD]
+        ) / math.sqrt(head_dim) # [BATCH, N_HEADS, LAST_Q, N_CTX]
+        print(f'qk shape: {qk.shape}')
 
         # LAST_Q_MASK: torch.Size([1, 1, 64, 64])
         # qk[:, :, :, -last_q:] = torch.where(LAST_Q_MASK[...,-last_q:,-last_q:].to(q.device), qk[:, :, :, -last_q:], -torch.inf)
         last_q_mask = LAST_Q_MASK[..., -last_q:, -last_q:].clone().to(q.device)
+
+        print(f'qk shape: {qk.shape}, last_q_mask shape: {last_q_mask.shape}')
         qk[:, :, :, -last_q:] = torch.where(last_q_mask, qk[:, :, :, -last_q:], -torch.inf)
 
         vertical = qk.sum(-2, keepdim=True)
