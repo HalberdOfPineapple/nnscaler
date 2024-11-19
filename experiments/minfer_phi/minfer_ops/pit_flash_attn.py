@@ -350,7 +350,7 @@ class VSSAttention(torch.autograd.Function):
         # Pad to context_length dimension (N_CTX) to be divisible by BLOCK_SIZE_M
         # torch.cuda.synchronize()
         # print("Starting padding QKV..", end=" ")
-        print(f'Context size: {context_size}, head dim: {head_dim}')
+        # print(f'Context size: {context_size}, head dim: {head_dim}')
         seq_pad = ((context_size + block_size_M - 1) // block_size_M) * block_size_M - context_size
         dim_pad = 2 ** math.ceil(math.log2(head_dim)) - head_dim
         query_pad = torch.nn.functional.pad(query, [0, dim_pad, 0, 0, 0, seq_pad, 0, 0])
@@ -435,13 +435,11 @@ def vs_attn_forward(
             q[:, -last_q:, :, :].contiguous(), # [BATCH, LAST_Q, N_HEADS, D_HEAD]
             k, # [BATCH, N_CTX, N_HEADS, D_HEAD]
         ) / math.sqrt(head_dim) # [BATCH, N_HEADS, LAST_Q, N_CTX]
-        print(f'qk shape: {qk.shape}')
 
         # LAST_Q_MASK: torch.Size([1, 1, 64, 64])
         # qk[:, :, :, -last_q:] = torch.where(LAST_Q_MASK[...,-last_q:,-last_q:].to(q.device), qk[:, :, :, -last_q:], -torch.inf)
         last_q_mask = LAST_Q_MASK[..., -last_q:, -last_q:].clone().to(q.device)
 
-        print(f'qk shape: {qk.shape}, last_q_mask shape: {last_q_mask.shape}')
         qk[:, :, :, -last_q:] = torch.where(last_q_mask, qk[:, :, :, -last_q:], -torch.inf)
 
         vertical = qk.sum(-2, keepdim=True)
