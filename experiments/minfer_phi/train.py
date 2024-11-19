@@ -295,7 +295,8 @@ def main(args):
     optimizer_config = OptimizerConfig(
         type=MixedPrecisionAdamW,
         args={
-            'lr': 2e-5, 
+            # 'lr': 2e-5, 
+            'lr': 1e-6,
             'betas': (0.9, 0.95), 
             'weight_decay': 0.0, 
             'fused': True

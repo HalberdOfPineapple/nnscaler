@@ -18,7 +18,7 @@ import torch.nn.functional as F
 logger = logging.getLogger(__name__)
 
 from torch import nn
-from typing import List, Optional, Tuple, Union, Any, Dict
+from typing import List, Optional, Tuple, Union, Any, Dict, Callable
 
 from nnscaler.graph.parser.register import register_op
 from nnscaler.ir import IRTensor
@@ -444,6 +444,64 @@ def forward_phi_model(
         attentions=all_self_attns,
     )
 
+def attn_fwd_by_heads(
+    query_states: torch.Tensor,
+    key_states: torch.Tensor,
+    value_states: torch.Tensor,
+    head_indices: torch.Tensor,
+    attention_mask: torch.Tensor,
+    config_list: List[Dict[str, Any]],
+    config: Dict[str, Any],
+    bsz: int,
+    q_len: int,
+    head_dim: int,
+    is_search: bool,
+    layer_idx: int,
+    starting_layer: int,
+    best_pattern_dict: Dict[int, Tuple[str, int, int, int]],
+):
+    # print(f"head_indices: {head_indices}")
+
+    output_list = []
+    assert(query_states.shape[1] == head_indices.shape[-1])
+
+    for head in range(query_states.size(1)):
+        head_idx: int = int(head_indices[head].item())
+
+        q = query_states[:, head, :, :].unsqueeze(1) # (bsz, 1, q_len, head_dim)
+        k = key_states[:, head, :, :].unsqueeze(1)
+        v = value_states[:, head, :, :].unsqueeze(1)
+
+        # If search mode is enabled and the current layer has not already been configured 
+        # => search for the best pattern
+        if is_search and layer_idx >= len(config_list):
+            with torch.no_grad():
+                config[head_idx] = search_pattern(q, k, head_idx)
+
+        # if search is disabled and the current layer is beyond  starting layer 
+        # => apply the kernel for calculating the attention based on the best pattern
+        if layer_idx >= starting_layer and not is_search:
+            pattern = best_pattern_dict.get(head_idx, ("vertical_and_slash", 1000, 6096, 1))
+            attn_output_head = minfer_attn_forward_v2(
+                q, k, v, head_dim, pattern
+            ).view(bsz, q_len, 1, head_dim)
+        elif is_flash_attn_2_available(): 
+            # if search is enabled or the current layer is before the starting layer, simply use flash attention 
+            # Note that the input to the flash attention function should be in the shape (bsz, q_len, head_dim, num_heads)
+            attn_output_head = nnscaler_flash_attention_forward(
+                q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2),
+                attention_mask, q_len, 
+                dropout=0.0, softmax_scale=None, causal=q_len != 1
+            )
+            attn_output_head = attn_output_head.view(bsz, q_len, 1, head_dim)
+        else:
+            attn_output_head = gather_qkv(q, k, v, attention_mask).view(bsz, q_len, 1, head_dim)
+        output_list.append(attn_output_head.squeeze(2))
+
+    output = torch.stack(output_list, dim=2)
+    return output
+register_op('b h l^ d^, b h l^ d^, b h l^ d^, h -> b l^ h d^')(attn_fwd_by_heads)
+
 
 def minference_forward():
     def forward(
@@ -511,48 +569,23 @@ def minference_forward():
         value_states = repeat_kv(value_states, self.num_key_value_groups)
 
         # Initialize the pattern config when search mode is enabled
+        config_list, config = [], {}
         if self.is_search:
             if os.path.exists(self.config_path):
                 config_list = json.load(open(self.config_path))
                 if self.config.num_hidden_layers == len(config_list):
                     assert False, f"Search completed. The config is located in {self.config_path}."
-            else:
-                config_list = []
-            config = {}
             print("Layer", self.layer_idx)
 
         with torch.autograd.set_detect_anomaly(True):
             if q_len != 1:
-                # output = torch.empty_like(query_states)
-                output_list = []
-                for head in range(query_states.size(1)):
-                    q = query_states[:, head, :, :].unsqueeze(1) # (bsz, 1, q_len, head_dim)
-                    k = key_states[:, head, :, :].unsqueeze(1)
-                    v = value_states[:, head, :, :].unsqueeze(1)
-
-                    # If search mode is enabled and the current layer has not already been configured 
-                    # => search for the best pattern
-                    if self.is_search and self.layer_idx >= len(config_list):
-                        with torch.no_grad():
-                            config[head] = search_pattern(q, k, head)
-
-                    # if search is disabled and the current layer is beyond  starting layer 
-                    # => apply the kernel for calculating the attention based on the best pattern
-                    if self.layer_idx >= self.starting_layer and not self.is_search:
-                        attn_output_head = self.minfer_attn_forward(q, k, v, head).view(bsz, q_len, 1, self.head_dim)
-                    elif is_flash_attn_2_available(): 
-                        # if search is enabled or the current layer is before the starting layer, simply use flash attention 
-                        # Note that the input to the flash attention function should be in the shape (bsz, q_len, head_dim, num_heads)
-                        attn_output_head = nnscaler_flash_attention_forward(
-                            q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2),
-                            attention_mask, q_len, 
-                            dropout=0.0, softmax_scale=None, causal=q_len != 1
-                        )
-                        attn_output_head = attn_output_head.view(bsz, q_len, 1, self.head_dim)
-                    else:
-                        attn_output_head = gather_qkv(q, k, v, attention_mask).view(bsz, q_len, 1, self.head_dim)
-                    output_list.append(attn_output_head.squeeze(2))
-                output = torch.stack(output_list, dim=2)
+                output = attn_fwd_by_heads(
+                    query_states, key_states, value_states, torch.arange(self.num_heads), attention_mask,
+                    config_list, config, bsz, q_len, 
+                    self.head_dim, self.is_search, 
+                    self.layer_idx, self.starting_layer, 
+                    self.best_pattern,
+                )
                 if self.is_search:
                     if len(config):
                         config_list.append(config)
@@ -569,7 +602,6 @@ def minference_forward():
             attn_output = self.o_proj(attn_output)
 
         return attn_output, None, past_key_value
-
     return forward
 
 def last_q_mask_to(last_q_mask: torch.Tensor, device) -> torch.Tensor:
@@ -579,6 +611,54 @@ register_op('b^ h^ l^ l^ -> b^ h^ l^ l^')(last_q_mask_to)
 def qk_einsum(q, k, head_dim):
     return torch.einsum(f'bhmk, bhnk -> bhmn', q, k) / math.sqrt(head_dim)
 register_op('b^ h^ last_l^ d^, b^ h^ l^ d^ -> b^ h^ last_l^ l^')(qk_einsum)
+
+
+def minfer_attn_forward_v2(
+        q, k, v, head_dim, 
+        pattern: Tuple[str, int, int, int],
+    ):
+    def dense(q, k, v, vertical_size=None, slash_size=None):
+        # return flash_attn_func(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1,2), 0.0, softmax_scale=None, causal=q_len != 1).view(bsz, 1, q_len, self.head_dim)
+        attn_output = nnscaler_flash_attention_forward(
+            q.transpose(1, 2), k.transpose(1, 2), v.transpose(1,2), 
+            dropout=0.0, softmax_scale=None, causal=q_len != 1
+        )
+        return attn_output.view(bsz, 1, q_len, head_dim)
+    
+    def vertical_and_slash_kernel(q: torch.Tensor, k, v, vertical_size, slash_size):
+        return vs_attn_forward(
+            q.transpose(1, 2),
+            k.transpose(1, 2),
+            v.transpose(1, 2),
+            q_len, vertical_size, slash_size, head_dim
+        ).view(bsz, 1, q_len, head_dim)
+
+    def block_sparse_kernel(q, k, v, vertical_size=None, slash_size=None):
+        topk = 100
+        # return block_sparse_attention(q, k, v, topk)
+        return bs_attn_forward(q, k, v, topk)
+
+    bsz, q_len = q.shape[0], q.shape[2]
+    if q_len == 1: return dense(q, k, v)
+
+    # ty, vertical_size, slash_size, _ = self.best_pattern.get(head_id, ("vertical_and_slash", 1000, 6096, 1))
+    ty, vertical_size, slash_size, _ = pattern
+
+    # TODO: DEBUG Setting
+    # if ty == 'stream_llm':
+    #     ty = 'vertical_and_slash'
+    #     vertical_size, slash_size = 1000, 6096
+
+    fc = {
+        "stream_llm": streaming_forward,
+        "vertical_and_slash": vertical_and_slash_kernel,
+        "block_sparse": block_sparse_kernel,
+    }[ty]
+
+    return fc(q, k, v, vertical_size, slash_size)
+
+
+
 
 def minfer_attn_forward(self, q, k, v, head_id):
     """
@@ -638,7 +718,6 @@ def minfer_phi_init(model: Phi3ForCausalLM, model_id: str, minfer_config: MInfer
     #     return minfer_config(model)
     if minfer_config.kv_cache_cpu or minfer_config.use_snapkv:
         raise NotImplementedError("Setup for KV Cache CPU and SnapKV modes are not supported for training")
-
 
     # Note that the Attention, Model and DecoderLayer are not hardcoded classes (e.g. LlamaDecoderLayer)
     # Instead they can fit for any model that uses such an architecture

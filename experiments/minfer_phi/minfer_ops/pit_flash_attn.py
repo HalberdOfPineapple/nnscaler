@@ -173,7 +173,8 @@ def _triton_mixed_sparse_attn_fwd_kernel(
     softmax_lse_ptr = softmax_lse + offs_lse[:, None]
 
     # log(sum(exp(qk - m_i))) = log(sum(exp(qk)) * exp(-m_i)) = log(sum(exp(qk))) - m_i
-    softmax_lse_vals = (tl.math.log2(l_i) + m_i) / 1.44269504  # Remove it on MInference backward
+    softmax_lse_vals = tl.math.log(l_i) + m_i / 1.44269504
+    # softmax_lse_vals = (tl.math.log2(l_i) + m_i) / 1.44269504  # Remove it on MInference backward
 
     # directly use log because the scale has been applied to q, which makes values in softmax equivalent to exp(x/sqrt(d_model))
     tl.store(softmax_lse_ptr, softmax_lse_vals.to(dtype)[:, None], mask=m_mask) 
@@ -461,9 +462,10 @@ def vs_attn_forward(
             seqlens, v_idx, s_idx, context_size, block_size_M, block_size_N,
         )
 
+    # print(f"Q dtype: {q.dtype}, K dtype: {k.dtype}, V dtype: {v.dtype}")
     return VSSAttention.apply(q, k, v, block_count, block_offset, column_count, column_index, seqlens)
 
-register_op('b num_head^ l^ hd^, b num_head^ l^ hd^, b num_head^ l^ hd^ -> b num_head^ l^ hd^')(vs_attn_forward)
+# register_op('b num_head^ l^ hd^, b num_head^ l^ hd^, b num_head^ l^ hd^ -> b num_head^ l^ hd^')(vs_attn_forward)
 
 
 if __name__ == '__main__':
@@ -497,6 +499,7 @@ if __name__ == '__main__':
     loss = torch.square(o_ref).sum(dtype=torch.float64)
     loss.backward()
     
+    # print(f'q_grad: {q_grad}, k_grad: {k_grad}, v_grad: {v_grad}')
     torch.testing.assert_close(o, o_ref, atol=1e-2, rtol=1e-2)
     torch.testing.assert_close(q_grad, q.grad, atol=1e-2, rtol=1e-2)
     torch.testing.assert_close(k_grad, k.grad, atol=1e-2, rtol=1e-2)
