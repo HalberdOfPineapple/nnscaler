@@ -539,20 +539,20 @@ def minference_forward():
                     # if search is disabled and the current layer is beyond  starting layer 
                     # => apply the kernel for calculating the attention based on the best pattern
                     if self.layer_idx >= self.starting_layer and not self.is_search:
-                        attn_output_head = self.minfer_attn_forward(q, k, v, head) # [bsz, 1, q_len, self.head_dim]
+                        attn_output_head = self.minfer_attn_forward(q, k, v, head).view(bsz, q_len, 1, self.head_dim)
                     elif is_flash_attn_2_available(): 
                         # if search is enabled or the current layer is before the starting layer, simply use flash attention 
                         # Note that the input to the flash attention function should be in the shape (bsz, q_len, head_dim, num_heads)
                         attn_output_head = nnscaler_flash_attention_forward(
-                            q.transpose(1, 2), k.transpose(1, 2), v.transpose(1,2),
+                            q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2),
                             attention_mask, q_len, 
                             dropout=0.0, softmax_scale=None, causal=q_len != 1
                         )
-                        attn_output_head = attn_output_head.view(bsz, 1, q_len, self.head_dim)
+                        attn_output_head = attn_output_head.view(bsz, q_len, 1, self.head_dim)
                     else:
-                        attn_output_head = gather_qkv(q, k, v, attention_mask)
-                    output_list.append(attn_output_head.squeeze(1))
-                output = torch.stack(output_list, dim=1)
+                        attn_output_head = gather_qkv(q, k, v, attention_mask).view(bsz, q_len, 1, self.head_dim)
+                    output_list.append(attn_output_head.squeeze(2))
+                output = torch.stack(output_list, dim=2)
                 if self.is_search:
                     if len(config):
                         config_list.append(config)
@@ -562,11 +562,10 @@ def minference_forward():
                 output =  flash_attn_func(
                     query_states.transpose(1, 2), 
                     key_states.transpose(1, 2), 
-                    value_states.transpose(1,2), 
+                    value_states.transpose(1, 2), 
                     0.0, softmax_scale=None, causal=q_len != 1
-                ).view(bsz, query_states.size(1), q_len, self.head_dim)
-            attn_output = output.transpose(1, 2).contiguous()
-            attn_output = attn_output.reshape(bsz, q_len, self.num_heads * self.head_dim)
+                )
+            attn_output = output.reshape(bsz, q_len, self.num_heads * self.head_dim).contiguous()
             attn_output = self.o_proj(attn_output)
 
         return attn_output, None, past_key_value
