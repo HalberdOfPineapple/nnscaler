@@ -154,9 +154,12 @@ class MixedPrecisionF16OptimizerMixin(TrainHook):
         """
         # self._clip_gnorm() is ParallelOptimizer.clip_gnorm
         grad_norm = self._multiply_factor * self._clip_gnorm()
+        # grad_norm = self._multiply_factor * self._clip_gnorm(max_norm)
         if max_norm is not None and max_norm > 0.0:
             clip_coef = (max_norm / (grad_norm + 1e-6)).clamp(max=1.0)
             self._multiply_factor *= clip_coef
+
+        # print(f"grad_norm: {grad_norm}, max_norm: {max_norm}, clip_coef: {clip_coef}, multiply_factor: {self._multiply_factor}")
         return grad_norm
 
 

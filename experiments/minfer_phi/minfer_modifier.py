@@ -591,6 +591,12 @@ def minference_forward():
                         config_list.append(config)
                     with open(self.config_path, 'w') as json_file:
                         json.dump(config_list, json_file)
+                # output =  flash_attn_func(
+                #     query_states.transpose(1, 2), 
+                #     key_states.transpose(1, 2), 
+                #     value_states.transpose(1, 2), 
+                #     0.0, softmax_scale=None, causal=q_len != 1
+                # )
             else:
                 output =  flash_attn_func(
                     query_states.transpose(1, 2), 

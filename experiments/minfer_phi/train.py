@@ -31,7 +31,7 @@ from nnscaler.runtime.f16_optimizer import MixedPrecisionAdamW
 from nnscaler.cli.loggers.tensorboard import TensorBoardLogger
 
 # from modeling_modifier import nnscaler_phi_init
-from minfer_modifier import minfer_phi_init
+# from minfer_modifier import minfer_phi_init
 from minfer_modules import ExprMInferConfig as MInferenceConfig, ExprMInference as MInference
 from chunk_linear_cross_entropy import chunk_linear_cross_entropy
 from custom_trainer import CustomTrainer as Trainer # from nnscaler.cli.trainer import Trainer
@@ -56,6 +56,12 @@ def nnscaler_phi_init(attn_type: str='flash', attn_save_path: str=None):
     from modeling_modifier import NNScalerPhiFlashAttention2
     
     PHI3_ATTENTION_CLASSES["flash_attention_2"] = NNScalerPhiFlashAttention2
+
+def minfer_phi_init():
+    from phi3 import PHI3_ATTENTION_CLASSES
+    from minfer_modifier_v2 import MInferAttention
+
+    PHI3_ATTENTION_CLASSES["flash_attention_2"] = MInferAttention
 
 def get_tokenizer(tokenizer_name_or_path,
                   model_max_length=None,
@@ -171,7 +177,15 @@ class MInferModel(BaselineModel):
         minfer_config: MInferenceConfig = minfer.config
         
         self.model = minfer_patch_setup(self.model, minfer_config)
-        self.model = minfer_phi_init(self.model, model_id, minfer_config)
+
+        Attention = self.model.model.layers[0].self_attn.__class__
+        def update_module(m):
+            if isinstance(m, Attention):
+                m.init_minference_parameters()
+        self.model.apply(update_module)
+
+        
+        # self.model = minfer_phi_init(self.model, model_id, minfer_config)
 
 
 def aggregate_outputs_fn(loss_outputs, sync_group) -> AggregatedOutputs:
@@ -207,8 +221,11 @@ def main(args):
     #     debugpy.wait_for_client()
 
     if args.minfer_type == MInferType.BASELINE:
-        print(f"{__name__} | Using Baseline Model...")
+        print(f"{__name__} | (Expr 0) Using Baseline Model...")
         nnscaler_phi_init()
+    elif args.minfer_type == MInferType.MF_DB:
+        print(f"{__name__} | (Expr 1) Using MInference Forward with Dense Backward...")
+        minfer_phi_init()
 
     minfer_config_path = os.path.join(MINFER_CONFIG_DIR, f'{args.name}.yaml')
     if not os.path.exists(minfer_config_path):
@@ -295,8 +312,8 @@ def main(args):
     optimizer_config = OptimizerConfig(
         type=MixedPrecisionAdamW,
         args={
-            # 'lr': 2e-5, 
-            'lr': 1e-6,
+            'lr': 2e-5, 
+            # 'lr': 1e-6,
             'betas': (0.9, 0.95), 
             'weight_decay': 0.0, 
             'fused': True

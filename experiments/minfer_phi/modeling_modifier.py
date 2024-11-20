@@ -17,7 +17,7 @@ import torch.nn.functional as F
 logger = logging.getLogger(__name__)
 
 from torch import nn
-from typing import List, Optional, Tuple, Union, Any
+from typing import List, Optional, Tuple, Union, Any, Dict
 
 from nnscaler.graph.parser.register import register_op
 from nnscaler.ir import IRTensor
@@ -489,3 +489,56 @@ def phi_flash_attention_anno(query_states, key_states, value_states, attention_m
     else:
         return f'b l^ {q_anno} hd^, b s^ {kv_anno} hd^, b s^ {kv_anno} vd^ -> b l^ {q_anno} vd^'
 register_op(phi_flash_attention_anno)(nnscaler_flash_attention_forward)
+
+
+from minfer_ops import vs_attn_forward
+def attn_fwd_by_heads(
+    query_states: torch.Tensor,
+    key_states: torch.Tensor,
+    value_states: torch.Tensor,
+    head_indices: torch.Tensor,
+    bsz: int,
+    q_len: int,
+    head_dim: int,
+    best_pattern_dict: Dict[int, Tuple[str, int, int, int]],
+):
+    # print(f"head_indices: {head_indices}")
+
+    output_list = []
+    assert(query_states.shape[1] == head_indices.shape[-1])
+
+    for head in range(query_states.size(1)):
+        head_idx: int = int(head_indices[head].item())
+
+        q = query_states[:, head, :, :].unsqueeze(1) # (bsz, 1, q_len, head_dim)
+        k = key_states[:, head, :, :].unsqueeze(1)
+        v = value_states[:, head, :, :].unsqueeze(1)
+
+        # if search is disabled and the current layer is beyond  starting layer 
+        # => apply the kernel for calculating the attention based on the best pattern
+        pattern = best_pattern_dict.get(head_idx, ("vertical_and_slash", 1000, 6096, 1))
+        ty, vertical_size, slash_size, _ = pattern
+
+        attn_output_head = vs_attn_forward(
+            q.transpose(1, 2),
+            k.transpose(1, 2),
+            v.transpose(1, 2),
+            q_len, vertical_size, slash_size, head_dim
+        ).view(bsz, 1, q_len, head_dim)
+        output_list.append(attn_output_head.squeeze(2))
+
+    output = torch.stack(output_list, dim=2)
+    return output
+
+def minfer_attn_anno(query_states, key_states, value_states, *args, **kwargs) -> str:
+    if query_states.shape[1] != key_states.shape[1]:
+        assert query_states.shape[1] % key_states.shape[1] == 0
+        group_size = query_states.shape[1] // key_states.shape[1]
+        assert query_states.shape[1] == value_states.shape[1] * group_size
+        q_anno = f'(group_num {group_size})'
+        kv_anno = 'group_num'
+    else:
+        q_anno = kv_anno = 'num_heads'
+
+    return f'b {q_anno} l^ hd^, b {kv_anno} s^ hd^, b {kv_anno} s^ vd^ -> b l^ {q_anno} vd^'
+register_op(minfer_attn_anno)(attn_fwd_by_heads)
