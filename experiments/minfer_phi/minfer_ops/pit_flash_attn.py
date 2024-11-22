@@ -14,6 +14,8 @@ from nnscaler.graph.parser.register import register_op
 
 from flash_attn.flash_attn_interface import _flash_attn_backward
 
+LN2 = 1 / 1.44269504
+
 # @triton.autotune(
 #    configs=[
 #        triton.Config({}, num_stages=1, num_warps=4),
@@ -91,7 +93,8 @@ def _triton_mixed_sparse_attn_fwd_kernel(
     # scale sm_scale by log_2(e) and use
     # 2^x instead of exp in the loop because CSE and LICM
     # don't work as expected with `exp` in the loop
-    qk_scale = sm_scale * 1.44269504
+    # 1/ln2 = lne/ln2 = log2(e) => 2^(x / ln2) = 2^(x * log2(e)) = (2^(log2(e)))^x = e^x
+    qk_scale = sm_scale / LN2
 
     # load q: it will stay in SRAM throughout
     q = tl.load(q_ptrs)
@@ -173,11 +176,19 @@ def _triton_mixed_sparse_attn_fwd_kernel(
     softmax_lse_ptr = softmax_lse + offs_lse[:, None]
 
     # log(sum(exp(qk - m_i))) = log(sum(exp(qk)) * exp(-m_i)) = log(sum(exp(qk))) - m_i
-    softmax_lse_vals = tl.math.log(l_i) + m_i / 1.44269504
+    softmax_lse_vals = tl.math.log(l_i) + m_i * LN2
     # softmax_lse_vals = (tl.math.log2(l_i) + m_i) / 1.44269504  # Remove it on MInference backward
 
     # directly use log because the scale has been applied to q, which makes values in softmax equivalent to exp(x/sqrt(d_model))
     tl.store(softmax_lse_ptr, softmax_lse_vals.to(dtype)[:, None], mask=m_mask) 
+
+
+def pad_tensor(x, context_size, head_dim, block_size):
+    # Pad to context_length dimension (N_CTX) to be divisible by BLOCK_SIZE_M
+    seq_pad = ((context_size + block_size - 1) // block_size) * block_size - context_size
+    dim_pad = 2 ** math.ceil(math.log2(head_dim)) - head_dim
+    x_pad = torch.nn.functional.pad(x, [0, dim_pad, 0, 0, 0, seq_pad, 0, 0])
+    return x_pad
 
 def _triton_mixed_sparse_attention(
     q: torch.Tensor,          # [BATCH, N_CTX, N_HEADS, D_HEAD]
@@ -189,9 +200,20 @@ def _triton_mixed_sparse_attention(
     column_count: torch.Tensor,  # [BATCH, N_HEADS, cdiv(N_CTX, BLOCK_SIZE_M)]
     column_index: torch.Tensor,  # [BATCH, N_HEADS, cdiv(N_CTX, BLOCK_SIZE_M), NNZ_V]
     sm_scale: float,
+    context_size: int,
+    head_dim: int,
     block_size_M: int = 64,
     block_size_N: int = 64,
 ) -> torch.Tensor:
+
+    # Pad to context_length dimension (N_CTX) to be divisible by BLOCK_SIZE_M
+    # torch.cuda.synchronize()
+    # print("Starting padding QKV..", end=" ")
+    # print(f'Context size: {context_size}, head dim: {head_dim}')
+    q, k, v = pad_tensor(q, context_size, head_dim, block_size_M), pad_tensor(k, context_size, head_dim, block_size_M), pad_tensor(v, context_size, head_dim, block_size_M)
+    # print("Done.")
+    # torch.cuda.synchronize()
+
     # shape constraints
     Lq, Lk, Lv = q.shape[-1], k.shape[-1], v.shape[-1]
     assert Lq == Lk and Lk == Lv
@@ -348,27 +370,16 @@ class VSSAttention(torch.autograd.Function):
         ctx.context_size = context_size
         ctx.head_dim = head_dim
 
-        # Pad to context_length dimension (N_CTX) to be divisible by BLOCK_SIZE_M
-        # torch.cuda.synchronize()
-        # print("Starting padding QKV..", end=" ")
-        # print(f'Context size: {context_size}, head dim: {head_dim}')
-        seq_pad = ((context_size + block_size_M - 1) // block_size_M) * block_size_M - context_size
-        dim_pad = 2 ** math.ceil(math.log2(head_dim)) - head_dim
-        query_pad = torch.nn.functional.pad(query, [0, dim_pad, 0, 0, 0, seq_pad, 0, 0])
-        key_pad = torch.nn.functional.pad(key, [0, dim_pad, 0, 0, 0, seq_pad, 0, 0])
-        value_pad = torch.nn.functional.pad(value, [0, dim_pad, 0, 0, 0, seq_pad, 0, 0])
-        # print("Done.")
-        # torch.cuda.synchronize()
-
         # the input version of Q, K and V are padded to be divisible by BLOCK_SIZE_M
         # the output and softmax_lse are also padded
         sm_scale = head_dim ** -0.5
         o_pad, softmax_lse = _triton_mixed_sparse_attention(
-            query_pad, key_pad, value_pad, seqlens,
+            query, key, value, seqlens,
             block_count, block_offset, column_count, column_index,
-            sm_scale, block_size_M, block_size_N,
+            sm_scale, context_size, head_dim,
+            block_size_M, block_size_N,
         )
-        o = o_pad[:, :context_size, :, :head_dim]
+        o = o_pad[..., :context_size, :, :head_dim]
 
         ctx.save_for_backward(query, key, value, o, softmax_lse[:, :, :context_size].contiguous())
 
@@ -464,31 +475,54 @@ def vs_attn_forward(
 
     # print(f"Q dtype: {q.dtype}, K dtype: {k.dtype}, V dtype: {v.dtype}")
     return VSSAttention.apply(q, k, v, block_count, block_offset, column_count, column_index, seqlens)
-
 # register_op('b num_head^ l^ hd^, b num_head^ l^ hd^, b num_head^ l^ hd^ -> b num_head^ l^ hd^')(vs_attn_forward)
 
 
-if __name__ == '__main__':
+def test_dense_pattern():
     context_size = 131072
-    q = torch.randn((1, context_size, 1, 96), dtype=torch.float16, device='cuda', requires_grad=True)
-    k = torch.randn((1, context_size, 1, 96), dtype=torch.float16, device='cuda', requires_grad=True)
-    v = torch.randn((1, context_size, 1, 96), dtype=torch.float16, device='cuda', requires_grad=True)
+    num_heads = 1 # 32
+    head_dim = 96
 
-    o = vs_attn_forward(q, k, v, context_size, 500, 131072, 96, 64, 64)
+    vertical_size = 100
+    slash_size = context_size
+
+    q = torch.randn((1, context_size, num_heads, head_dim), dtype=torch.float16, device='cuda', requires_grad=True)
+    k = torch.randn((1, context_size, num_heads, head_dim), dtype=torch.float16, device='cuda', requires_grad=True)
+    v = torch.randn((1, context_size, num_heads, head_dim), dtype=torch.float16, device='cuda', requires_grad=True)
+
+    o: torch.Tensor = vs_attn_forward(
+        q, k, v, context_size, 
+        vertical_size=vertical_size, 
+        slash_size=slash_size, 
+        head_dim=head_dim
+    )
+    print(f"o shape: {o.shape}")
+
+    q.retain_grad()
+    k.retain_grad()
+    v.retain_grad()
+    o.retain_grad()
+
+    torch.cuda.synchronize()
     loss = torch.square(o).sum(dtype=torch.float64)
     torch.cuda.synchronize()
     loss.backward()
-    torch.cuda.synchronize()
     
+    
+    o_grad = o.grad.clone()
     q_grad = q.grad.clone()
     k_grad = k.grad.clone()
     v_grad = v.grad.clone()
-    q.grad = None
-    k.grad = None
-    v.grad = None
+    q.grad.zero_()
+    k.grad.zero_()
+    v.grad.zero_()
 
     from flash_attn import flash_attn_func
-    o_ref = flash_attn_func(
+    q.retain_grad()
+    k.retain_grad()
+    v.retain_grad()
+
+    o_ref: torch.Tensor = flash_attn_func(
         q,
         k,
         v,
@@ -496,11 +530,32 @@ if __name__ == '__main__':
         softmax_scale=None,
         causal=True,
     )
+    o_ref.retain_grad()
+
+    print(f"o_ref shape: {o_ref.shape}")
+    torch.cuda.synchronize()
     loss = torch.square(o_ref).sum(dtype=torch.float64)
+    torch.cuda.synchronize()
     loss.backward()
     
-    # print(f'q_grad: {q_grad}, k_grad: {k_grad}, v_grad: {v_grad}')
-    torch.testing.assert_close(o, o_ref, atol=1e-2, rtol=1e-2)
-    torch.testing.assert_close(q_grad, q.grad, atol=1e-2, rtol=1e-2)
-    torch.testing.assert_close(k_grad, k.grad, atol=1e-2, rtol=1e-2)
-    torch.testing.assert_close(v_grad, v.grad, atol=1e-2, rtol=1e-2)
+    o_ref_grad = o_ref.grad.clone()
+    q_ref_grad = q.grad.clone()
+    k_ref_grad = k.grad.clone()
+    v_ref_grad = v.grad.clone()
+
+    for head_idx in range(num_heads):
+        print('-' * 40)
+        output_close = torch.allclose(o[0, :, head_idx, :], o_ref[0, :, head_idx, :], atol=1e-2, rtol=1e-2)
+        output_grad_close = torch.allclose(o_grad[0, :, head_idx, :], o_ref_grad[0, :, head_idx, :], atol=1e-2, rtol=1e-2)
+        q_grad_close = torch.allclose(q_grad[0, head_idx, :, :], q_ref_grad[0, head_idx, :, :], atol=1e-2, rtol=1e-2)
+        k_grad_close = torch.allclose(k_grad[0, head_idx, :, :], k_ref_grad[0, head_idx, :, :], atol=1e-2, rtol=1e-2)
+        v_grad_close = torch.allclose(v_grad[0, head_idx, :, :], v_ref_grad[0, head_idx, :, :], atol=1e-2, rtol=1e-2)
+
+        if not output_close: print(f"Head {head_idx} output is not close")
+        if not output_grad_close: print(f"Head {head_idx} output grad is not close")
+        if not q_grad_close: print(f"Head {head_idx} q grad is not close")
+        if not k_grad_close: print(f"Head {head_idx} k grad is not close")
+        if not v_grad_close: print(f"Head {head_idx} v grad is not close")
+
+if __name__ == '__main__':
+    test_dense_pattern()

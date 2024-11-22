@@ -6,12 +6,9 @@ import torch
 import datasets
 import argparse
 import huggingface_hub
-from typing import Dict
+from typing import Dict, List
 from datasets import load_from_disk
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer, DataCollatorForLanguageModeling
-
-# from minference import MInference
-# from minference.minference_configuration import MInferenceConfig
 
 from nnscaler.utils import set_default_logger_level
 from nnscaler.cli.trainer_args import (
@@ -30,8 +27,6 @@ from nnscaler.parallel import ComputeConfig, BroadcastGenFilesStrategy
 from nnscaler.runtime.f16_optimizer import MixedPrecisionAdamW
 from nnscaler.cli.loggers.tensorboard import TensorBoardLogger
 
-# from modeling_modifier import nnscaler_phi_init
-# from minfer_modifier import minfer_phi_init
 from minfer_modules import ExprMInferConfig as MInferenceConfig, ExprMInference as MInference
 from chunk_linear_cross_entropy import chunk_linear_cross_entropy
 from custom_trainer import CustomTrainer as Trainer # from nnscaler.cli.trainer import Trainer
@@ -129,7 +124,7 @@ def minfer_patch_setup(model, minfer_config: MInferenceConfig):
     return model
 
 class BaselineModel(torch.nn.Module):
-    def __init__(self, model_id, config_path: str=None):
+    def __init__(self, model_id, config_path: str=None, selected_layers: List[int]=[]):
         super().__init__()
         from phi3 import Phi3ForCausalLM
 
@@ -145,6 +140,8 @@ class BaselineModel(torch.nn.Module):
                 model_id,
                 config=model_config,
             )
+        if len(selected_layers) > 0:
+            self.model.model.layers = torch.nn.ModuleList([self.model.model.layers[i] for i in selected_layers])
             
         print(f'{__name__} BaselineModel Selt-Attention Class: {self.model.model.layers[0].self_attn.__class__.__name__}')
 
@@ -162,10 +159,11 @@ class BaselineModel(torch.nn.Module):
         return loss, loss.data, samples['ntokens'], samples['nsentences']
 
 class MInferModel(BaselineModel):
-    def __init__(self, model_id, config_path: str=None, minfer_config: Dict={}):
+    def __init__(self, model_id, config_path: str=None, minfer_config: Dict={}, selected_layers: List[int]=[]):
         super().__init__(
             model_id=model_id,
-            config_path=config_path
+            config_path=config_path,
+            selected_layers=selected_layers,
         )
 
         minfer_attn_type = minfer_config.pop('attn_type', 'minference')
@@ -184,7 +182,6 @@ class MInferModel(BaselineModel):
                 m.init_minference_parameters()
         self.model.apply(update_module)
 
-        
         # self.model = minfer_phi_init(self.model, model_id, minfer_config)
 
 
@@ -301,6 +298,7 @@ def main(args):
     model_args = {
         'model_id': args.model_id,
         'config_path': args.model_config_path,
+        'selected_layers': args.selected_layers,
     }
     if args.minfer_type != 'baseline': model_args['minfer_config'] = minfer_config
     model_config = ModelConfig(
@@ -464,6 +462,9 @@ if __name__ == '__main__':
 
     parser.add_argument('-p', '--disable_progressbar',action='store_true',help='transformers model id',)
 
+    # add selected layers as the argument
+    parser.add_argument('--selected_layers', type=str, default='[]', help='selected layers')
+
     args = parser.parse_args()
     print_args(args)
 
@@ -473,5 +474,6 @@ if __name__ == '__main__':
     if args.n_iter <= 0: args.n_iter = None
     if args.n_epochs <= 0: args.n_epochs = None
 
+    args.selected_layers = eval(args.selected_layers)
     main(args)
 

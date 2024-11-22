@@ -100,35 +100,11 @@ class MInferAttention(PhiAttention):
         # Because the input can be padded, the absolute sequence length depends on the max position id.
         rotary_seq_len = max(kv_seq_len, position_ids[:, -1].max().item()) + 1
         cos, sin = self.rotary_emb(value_states, position_ids, seq_len=rotary_seq_len)
-
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
+        # cos, sin = self.rotary_emb(value_states, position_ids, seq_len=kv_seq_len)
+        # query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
 
         if past_key_value is not None:
-            # Activate slicing cache only if the config has a value `sliding_windows` attribute
-            cache_has_contents = past_key_value.get_seq_length(self.layer_idx) > 0
-            if (
-                getattr(self.config, "sliding_window", None) is not None
-                and kv_seq_len > self.config.sliding_window
-                and cache_has_contents
-            ):
-                slicing_tokens = 1 - self.config.sliding_window
-
-                past_key = past_key_value[self.layer_idx][0]
-                past_value = past_key_value[self.layer_idx][1]
-
-                past_key = past_key[:, :, slicing_tokens:, :].contiguous()
-                past_value = past_value[:, :, slicing_tokens:, :].contiguous()
-
-                if past_key.shape[-2] != self.config.sliding_window - 1:
-                    raise ValueError(
-                        f"past key must have a shape of (`batch_size, num_heads, self.config.sliding_window-1, head_dim`), got"
-                        f" {past_key.shape}"
-                    )
-
-                if attention_mask is not None:
-                    attention_mask = attention_mask[:, slicing_tokens:]
-                    attention_mask = torch.cat([attention_mask, torch.ones_like(attention_mask[:, -1:])], dim=-1)
-
             cache_kwargs = {"sin": sin, "cos": cos}  # Specific to RoPE models
             key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
 
@@ -136,42 +112,17 @@ class MInferAttention(PhiAttention):
         key_states = repeat_kv(key_states, self.num_key_value_groups)
         value_states = repeat_kv(value_states, self.num_key_value_groups)
 
-        # attn_dropout = self.attention_dropout if self.training else 0.0
-
-        # In PEFT, usually we cast the layer norms in float32 for training stability reasons
-        # therefore the input hidden states gets silently casted in float32. Hence, we need
-        # cast them back in the correct dtype just to be sure everything works as expected.
-        # This might slowdown training & inference so it is recommended to not cast the LayerNorms
-        # in fp32.
-
-        if query_states.dtype == torch.float32:
-            if torch.is_autocast_enabled():
-                target_dtype = torch.get_autocast_gpu_dtype()
-            # Handle the case where the model is quantized
-            elif hasattr(self.config, "_pre_quantization_dtype"):
-                target_dtype = self.config._pre_quantization_dtype
-            else:
-                target_dtype = self.qkv_proj.weight.dtype
-
-            logger.warning_once(
-                f"The input hidden states seems to be silently casted in float32, this might be related to"
-                f" the fact you have upcasted embedding or layer norm layers in float32. We will cast back the input in"
-                f" {target_dtype}."
-            )
-
-            query_states = query_states.to(target_dtype)
-            key_states = key_states.to(target_dtype)
-            value_states = value_states.to(target_dtype)
-
-        # pattern = self.best_pattern.get(self.layer_idx, ("vertical_and_slash", 1000, 6096, 1))
-        pattern = self.best_pattern.get(self.layer_idx, ("vertical_and_slash", 100, q_len, 1))
+        pattern = self.best_pattern.get(self.layer_idx, ("vertical_and_slash", 1000, 6096, 1))
+        # pattern = ("vertical_and_slash", 100, q_len, 1)
         head_indices = torch.arange(query_states.shape[1], device=query_states.device, dtype=torch.int32)
+
 
         # print(f"query_states: {query_states.shape}, key_states: {key_states.shape}, value_states: {value_states.shape}, head_indices: {head_indices.shape}")
         attn_output = attn_fwd_by_heads(
             query_states, key_states, value_states, head_indices,
             bsz, q_len,  self.head_dim, pattern,
         ) # expect:  b l^ {q_anno} vd^'
+        
 
         attn_output = attn_output.reshape(bsz, q_len, self.hidden_size).contiguous()
         attn_output = self.o_proj(attn_output)
@@ -190,28 +141,31 @@ def attn_fwd_by_heads(
     pattern: Tuple[str, int, int, int],
 ):
     # print(f"head_indices: {head_indices}")
+    with torch.autograd.set_detect_anomaly(True):
+        output_list = []
+        assert(query_states.shape[1] == head_indices.shape[-1])
 
-    output_list = []
-    assert(query_states.shape[1] == head_indices.shape[-1])
+        for head in range(query_states.size(1)):
+            q = query_states[:, head, :, :].unsqueeze(1) # (bsz, 1, q_len, head_dim)
+            k = key_states[:, head, :, :].unsqueeze(1)
+            v = value_states[:, head, :, :].unsqueeze(1)
 
-    for head in range(query_states.size(1)):
-        q = query_states[:, head, :, :].unsqueeze(1) # (bsz, 1, q_len, head_dim)
-        k = key_states[:, head, :, :].unsqueeze(1)
-        v = value_states[:, head, :, :].unsqueeze(1)
+            # if search is disabled and the current layer is beyond  starting layer 
+            # => apply the kernel for calculating the attention based on the best pattern
+            ty, vertical_size, slash_size, _ = pattern
+            attn_output_head = vs_attn_forward(
+                q.transpose(1, 2),
+                k.transpose(1, 2),
+                v.transpose(1, 2),
+                q_len, vertical_size, slash_size, head_dim
+            ).view(bsz, q_len, 1, head_dim)
+            # output_list.append(attn_output_head.squeeze(2))
+            output_list.append(attn_output_head)
 
-        # if search is disabled and the current layer is beyond  starting layer 
-        # => apply the kernel for calculating the attention based on the best pattern
-        ty, vertical_size, slash_size, _ = pattern
-        attn_output_head = vs_attn_forward(
-            q.transpose(1, 2),
-            k.transpose(1, 2),
-            v.transpose(1, 2),
-            q_len, vertical_size, slash_size, head_dim
-        ).view(bsz, q_len, 1, head_dim)
-        output_list.append(attn_output_head.squeeze(2))
-
-    output = torch.stack(output_list, dim=2)
+        # output = torch.stack(output_list, dim=2)
+        output = torch.cat(output_list, dim=2)
     return output
+
 
 def minfer_attn_anno(query_states, key_states, value_states, *args, **kwargs) -> str:
     if query_states.shape[1] != key_states.shape[1]:
@@ -224,4 +178,354 @@ def minfer_attn_anno(query_states, key_states, value_states, *args, **kwargs) ->
         q_anno = kv_anno = 'num_heads'
 
     return f'b {q_anno} l^ hd^, b {kv_anno} s^ hd^, b {kv_anno} s^ vd^, {q_anno} -> b l^ {q_anno} vd^'
+
+# if __name__ != "__main__":
+#     register_op(minfer_attn_anno)(attn_fwd_by_heads)
 register_op(minfer_attn_anno)(attn_fwd_by_heads)
+
+
+
+def attn_fwd_by_heads_v2(
+    query_states: torch.Tensor,
+    key_states: torch.Tensor,
+    value_states: torch.Tensor,
+    head_indices: torch.Tensor,
+    bsz: int,
+    q_len: int,
+    head_dim: int,
+    pattern: Tuple[str, int, int, int],
+):
+    # print(f"head_indices: {head_indices}")
+
+    torch.cuda.synchronize()
+    with torch.autograd.set_detect_anomaly(True):
+        num_heads = query_states.shape[1]
+        assert(num_heads == head_indices.shape[-1])
+
+        ty, vertical_size, slash_size, _ = pattern
+        output = vs_attn_forward(
+            query_states.transpose(1, 2),
+            key_states.transpose(1, 2),
+            value_states.transpose(1, 2),
+            q_len, vertical_size, slash_size, head_dim
+        ).view(bsz, q_len, num_heads, head_dim)
+
+    torch.cuda.synchronize()
+    return output
+
+def test_wo_chunks():
+    from flash_attn import flash_attn_func
+
+    batch_size = 1
+    context_size = 131072
+    num_heads = 32
+    head_dim = 96
+
+    q = torch.randn((batch_size, num_heads, context_size, head_dim), dtype=torch.float16, device='cuda', requires_grad=True)
+    k = torch.randn((batch_size, num_heads, context_size, head_dim), dtype=torch.float16, device='cuda', requires_grad=True)
+    v = torch.randn((batch_size, num_heads, context_size, head_dim), dtype=torch.float16, device='cuda', requires_grad=True)
+    head_indices = torch.arange(num_heads, device='cuda', dtype=torch.int32)
+
+    o = attn_fwd_by_heads(
+        q, k, v, head_indices,
+        batch_size, context_size, head_dim, 
+        ("vertical_and_slash", 100, context_size, 1)
+    ) # [batch_size, context_size, num_heads, head_dim]
+    print(f"o.shape: {o.shape}")
+
+    q.retain_grad()
+    k.retain_grad()
+    v.retain_grad()
+    o.retain_grad()
+
+    loss = torch.square(o).sum(dtype=torch.float64)
+    torch.cuda.synchronize()
+    loss.backward()
+    torch.cuda.synchronize()
+    
+    o_grad = o.grad.clone()
+    q_grad = q.grad.clone()
+    k_grad = k.grad.clone()
+    v_grad = v.grad.clone()
+    q.grad.zero_()
+    k.grad.zero_()
+    v.grad.zero_()
+
+    print(f"o_grad.shape: {o_grad.shape}")  
+    print(f"q_grad.shape: {q_grad.shape}")
+    print(f"k_grad.shape: {k_grad.shape}")
+    print(f"v_grad.shape: {v_grad.shape}")
+
+    o_ref = flash_attn_func(
+        q.transpose(1, 2),
+        k.transpose(1, 2),
+        v.transpose(1, 2),
+        dropout_p=0.0,
+        softmax_scale=None,
+        causal=True,
+    ) # b l^ {q_anno} vd^
+    print(f"o_ref.shape: {o_ref.shape}")
+
+    q.retain_grad()
+    k.retain_grad()
+    v.retain_grad()
+    o_ref.retain_grad()
+
+    loss_ref = torch.square(o_ref).sum(dtype=torch.float64)
+    loss_ref.backward()
+
+    o_ref_grad = o_ref.grad.clone()
+    q_ref_grad = q.grad.clone()
+    k_ref_grad = k.grad.clone()
+    v_ref_grad = v.grad.clone()
+
+    print(f"o_ref_grad.shape: {o_ref_grad.shape}")
+    print(f"q_ref_grad.shape: {q_ref_grad.shape}")
+    print(f"k_ref_grad.shape: {k_ref_grad.shape}")
+    print(f"v_ref_grad.shape: {v_ref_grad.shape}")
+
+
+    for head_idx in range(num_heads):
+        print('-' * 40)
+        output_close = torch.allclose(o[0, :, head_idx, :], o_ref[0, :, head_idx, :], atol=1e-2, rtol=1e-2)
+        output_grad_close = torch.allclose(o_grad[0, :, head_idx, :], o_ref_grad[0, :, head_idx, :], atol=1e-2, rtol=1e-2)
+        q_grad_close = torch.allclose(q_grad[0, head_idx, :, :], q_ref_grad[0, head_idx, :, :], atol=1e-2, rtol=1e-2)
+        k_grad_close = torch.allclose(k_grad[0, head_idx, :, :], k_ref_grad[0, head_idx, :, :], atol=1e-2, rtol=1e-2)
+        v_grad_close = torch.allclose(v_grad[0, head_idx, :, :], v_ref_grad[0, head_idx, :, :], atol=1e-2, rtol=1e-2)
+
+        if not output_close: print(f"Head {head_idx} output is not close")
+        if not output_grad_close: print(f"Head {head_idx} output grad is not close")
+        if not q_grad_close: print(f"Head {head_idx} q grad is not close")
+        if not k_grad_close: print(f"Head {head_idx} k grad is not close")
+        if not v_grad_close: print(f"Head {head_idx} v grad is not close")
+
+def test_w_chunks():
+    from flash_attn import flash_attn_func
+
+    batch_size = 1
+    context_size = 131072
+    num_heads = 32
+    head_dim = 96
+
+
+    q = torch.randn((batch_size, num_heads, context_size, head_dim), dtype=torch.float16, device='cuda', requires_grad=True)
+    k = torch.randn((batch_size, num_heads, context_size, head_dim), dtype=torch.float16, device='cuda', requires_grad=True)
+    v = torch.randn((batch_size, num_heads, context_size, head_dim), dtype=torch.float16, device='cuda', requires_grad=True)
+    head_indices = torch.arange(num_heads, device='cuda', dtype=torch.int32)
+    chunk_size = 4
+
+    q_chunks = q.chunk(chunk_size, dim=1)
+    k_chunks = k.chunk(chunk_size, dim=1)
+    v_chunks = v.chunk(chunk_size, dim=1)
+    head_indices_chunks = head_indices.chunk(chunk_size)
+    o_chunks = []
+
+
+    q.retain_grad()
+    k.retain_grad()
+    v.retain_grad()
+    
+
+    for q_chunk, k_chunk, v_chunk, head_indice_chunk in zip(q_chunks, k_chunks, v_chunks, head_indices_chunks):
+        o_chunk = attn_fwd_by_heads(
+            q_chunk, k_chunk, v_chunk, head_indice_chunk,
+            batch_size, context_size, head_dim, 
+            ("vertical_and_slash", 100, context_size, 1)
+        )
+        o_chunks.append(o_chunk)
+    o = torch.cat(o_chunks, dim=2)
+    o.retain_grad()
+    print(f"o.shape: {o.shape}")
+
+    torch.cuda.synchronize()
+    loss = torch.square(o).sum(dtype=torch.float64)
+    torch.cuda.synchronize()
+    loss.backward()
+
+    o_grad = o.grad.clone()
+    q_grad = q.grad.clone()
+    k_grad = k.grad.clone()
+    v_grad = v.grad.clone()
+    q.grad.zero_()
+    k.grad.zero_()
+    v.grad.zero_()
+
+    print(f"o_grad.shape: {o_grad.shape}")  
+    print(f"q_grad.shape: {q_grad.shape}")
+    print(f"k_grad.shape: {k_grad.shape}")
+    print(f"v_grad.shape: {v_grad.shape}")
+
+
+
+
+    # ---------------------------------
+    q.retain_grad()
+    k.retain_grad()
+    v.retain_grad()
+
+    o_ref_chunks = []
+    for q_chunk, k_chunk, v_chunk, head_indice_chunk in zip(q_chunks, k_chunks, v_chunks, head_indices_chunks):
+        o_ref_chunk = flash_attn_func(
+            q_chunk.transpose(1, 2),
+            k_chunk.transpose(1, 2),
+            v_chunk.transpose(1, 2),
+            dropout_p=0.0,
+            softmax_scale=None,
+            causal=True,
+        )
+        o_ref_chunks.append(o_ref_chunk)
+    o_ref = torch.cat(o_ref_chunks, dim=2)
+    o_ref.retain_grad()
+    print(f"o_ref.shape: {o_ref.shape}")
+
+    torch.cuda.synchronize()
+    loss_ref = torch.square(o_ref).sum(dtype=torch.float64)
+    torch.cuda.synchronize()
+    loss_ref.backward()
+
+    o_ref_grad = o_ref.grad.clone()
+    q_ref_grad = q.grad.clone()
+    k_ref_grad = k.grad.clone()
+    v_ref_grad = v.grad.clone()
+
+    print(f"o_ref_grad.shape: {o_ref_grad.shape}")
+    print(f"q_ref_grad.shape: {q_ref_grad.shape}")
+    print(f"k_ref_grad.shape: {k_ref_grad.shape}")
+    print(f"v_ref_grad.shape: {v_ref_grad.shape}")
+
+
+    for head_idx in range(num_heads):
+        print('-' * 40)
+        output_close = torch.allclose(o[0, :, head_idx, :], o_ref[0, :, head_idx, :], atol=1e-2, rtol=1e-2)
+        output_grad_close = torch.allclose(o_grad[0, :, head_idx, :], o_ref_grad[0, :, head_idx, :], atol=1e-2, rtol=1e-2)
+        q_grad_close = torch.allclose(q_grad[0, head_idx, :, :], q_ref_grad[0, head_idx, :, :], atol=1e-2, rtol=1e-2)
+        k_grad_close = torch.allclose(k_grad[0, head_idx, :, :], k_ref_grad[0, head_idx, :, :], atol=1e-2, rtol=1e-2)
+        v_grad_close = torch.allclose(v_grad[0, head_idx, :, :], v_ref_grad[0, head_idx, :, :], atol=1e-2, rtol=1e-2)
+
+        if not output_close: print(f"Head {head_idx} output is not close")
+        if not output_grad_close: print(f"Head {head_idx} output grad is not close")
+        if not q_grad_close: print(f"Head {head_idx} q grad is not close")
+        if not k_grad_close: print(f"Head {head_idx} k grad is not close")
+        if not v_grad_close: print(f"Head {head_idx} v grad is not close")
+
+
+
+def test_w_chunks():
+    from flash_attn import flash_attn_func
+
+    batch_size = 1
+    context_size = 131072
+    num_heads = 32
+    head_dim = 96
+    hidden_size = num_heads * head_dim
+
+    q = torch.randn((batch_size, num_heads, context_size, head_dim), dtype=torch.float16, device='cuda', requires_grad=True)
+    k = torch.randn((batch_size, num_heads, context_size, head_dim), dtype=torch.float16, device='cuda', requires_grad=True)
+    v = torch.randn((batch_size, num_heads, context_size, head_dim), dtype=torch.float16, device='cuda', requires_grad=True)
+    head_indices = torch.arange(num_heads, device='cuda', dtype=torch.int32)
+    chunk_size = 4
+
+    q_chunks = q.chunk(chunk_size, dim=1)
+    k_chunks = k.chunk(chunk_size, dim=1)
+    v_chunks = v.chunk(chunk_size, dim=1)
+    head_indices_chunks = head_indices.chunk(chunk_size)
+    o_chunks = []
+
+
+    q.retain_grad()
+    k.retain_grad()
+    v.retain_grad()
+    
+
+    for q_chunk, k_chunk, v_chunk, head_indice_chunk in zip(q_chunks, k_chunks, v_chunks, head_indices_chunks):
+        o_chunk = attn_fwd_by_heads(
+            q_chunk, k_chunk, v_chunk, head_indice_chunk,
+            batch_size, context_size, head_dim, 
+            ("vertical_and_slash", 100, context_size, 1)
+        )
+        o_chunks.append(o_chunk)
+    o = torch.cat(o_chunks, dim=2)
+    o.retain_grad()
+    print(f"o.shape: {o.shape}")
+
+    torch.cuda.synchronize()
+    loss = torch.square(o).sum(dtype=torch.float64)
+    torch.cuda.synchronize()
+    loss.backward()
+
+    o_grad = o.grad.clone()
+    q_grad = q.grad.clone()
+    k_grad = k.grad.clone()
+    v_grad = v.grad.clone()
+    q.grad.zero_()
+    k.grad.zero_()
+    v.grad.zero_()
+
+    print(f"o_grad.shape: {o_grad.shape}")  
+    print(f"q_grad.shape: {q_grad.shape}")
+    print(f"k_grad.shape: {k_grad.shape}")
+    print(f"v_grad.shape: {v_grad.shape}")
+
+
+
+
+    # ---------------------------------
+    q.retain_grad()
+    k.retain_grad()
+    v.retain_grad()
+
+    o_ref_chunks = []
+    for q_chunk, k_chunk, v_chunk, head_indice_chunk in zip(q_chunks, k_chunks, v_chunks, head_indices_chunks):
+        o_ref_chunk = flash_attn_func(
+            q_chunk.transpose(1, 2),
+            k_chunk.transpose(1, 2),
+            v_chunk.transpose(1, 2),
+            dropout_p=0.0,
+            softmax_scale=None,
+            causal=True,
+        )
+        o_ref_chunks.append(o_ref_chunk)
+    o_ref = torch.cat(o_ref_chunks, dim=2)
+    o_ref.retain_grad()
+    print(f"o_ref.shape: {o_ref.shape}")
+
+    torch.cuda.synchronize()
+    loss_ref = torch.square(o_ref).sum(dtype=torch.float64)
+    torch.cuda.synchronize()
+    loss_ref.backward()
+
+    o_ref_grad = o_ref.grad.clone()
+    q_ref_grad = q.grad.clone()
+    k_ref_grad = k.grad.clone()
+    v_ref_grad = v.grad.clone()
+
+    print(f"o_ref_grad.shape: {o_ref_grad.shape}")
+    print(f"q_ref_grad.shape: {q_ref_grad.shape}")
+    print(f"k_ref_grad.shape: {k_ref_grad.shape}")
+    print(f"v_ref_grad.shape: {v_ref_grad.shape}")
+
+
+    for head_idx in range(num_heads):
+        print('-' * 40)
+        output_close = torch.allclose(o[0, :, head_idx, :], o_ref[0, :, head_idx, :], atol=1e-2, rtol=1e-2)
+        output_grad_close = torch.allclose(o_grad[0, :, head_idx, :], o_ref_grad[0, :, head_idx, :], atol=1e-2, rtol=1e-2)
+        q_grad_close = torch.allclose(q_grad[0, head_idx, :, :], q_ref_grad[0, head_idx, :, :], atol=1e-2, rtol=1e-2)
+        k_grad_close = torch.allclose(k_grad[0, head_idx, :, :], k_ref_grad[0, head_idx, :, :], atol=1e-2, rtol=1e-2)
+        v_grad_close = torch.allclose(v_grad[0, head_idx, :, :], v_ref_grad[0, head_idx, :, :], atol=1e-2, rtol=1e-2)
+
+        if not output_close: print(f"Head {head_idx} output is not close")
+        if not output_grad_close: print(f"Head {head_idx} output grad is not close")
+        if not q_grad_close: print(f"Head {head_idx} q grad is not close")
+        if not k_grad_close: print(f"Head {head_idx} k grad is not close")
+        if not v_grad_close: print(f"Head {head_idx} v grad is not close")
+
+
+if __name__ == "__main__":
+    # print('-' * 80)
+    # print(f"Test without chunks...")
+    # test_wo_chunks()
+
+
+    print('-' * 80)
+    print(f"Test with chunks...")
+    test_w_chunks()
