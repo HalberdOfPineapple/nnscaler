@@ -411,9 +411,7 @@ class VSSAttention(torch.autograd.Function):
             rng_state=None,
         )
 
-        return dq[..., :context_size, :head_dim], dk[..., :context_size, :head_dim], dv[..., :context_size, :head_dim], None, None, None, None, None
-        
-        # return grad_output[..., :context_size, :head_dim].clone(), grad_output[..., :context_size, :head_dim].clone(), grad_output[..., :context_size, :head_dim].clone(), None, None, None, None, None
+        return dq[:, :context_size, :, :head_dim], dk[:, :context_size, :, :head_dim], dv[:, :context_size, :, :head_dim], None, None, None, None, None
 
 
 class VSSAttentionV2(torch.autograd.Function):
@@ -480,7 +478,7 @@ def vs_attn_forward(
 
 def test_dense_pattern():
     context_size = 131072
-    num_heads = 1 # 32
+    num_heads = 2 # 32
     head_dim = 96
 
     vertical_size = 100
