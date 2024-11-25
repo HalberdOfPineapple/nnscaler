@@ -205,14 +205,7 @@ def _triton_mixed_sparse_attention(
     block_size_M: int = 64,
     block_size_N: int = 64,
 ) -> torch.Tensor:
-
-    # Pad to context_length dimension (N_CTX) to be divisible by BLOCK_SIZE_M
-    # torch.cuda.synchronize()
-    # print("Starting padding QKV..", end=" ")
-    # print(f'Context size: {context_size}, head dim: {head_dim}')
     q, k, v = pad_tensor(q, context_size, head_dim, block_size_M), pad_tensor(k, context_size, head_dim, block_size_M), pad_tensor(v, context_size, head_dim, block_size_M)
-    # print("Done.")
-    # torch.cuda.synchronize()
 
     # shape constraints
     Lq, Lk, Lv = q.shape[-1], k.shape[-1], v.shape[-1]
@@ -473,8 +466,6 @@ def vs_attn_forward(
 
     # print(f"Q dtype: {q.dtype}, K dtype: {k.dtype}, V dtype: {v.dtype}")
     return VSSAttention.apply(q, k, v, block_count, block_offset, column_count, column_index, seqlens)
-# register_op('b num_head^ l^ hd^, b num_head^ l^ hd^, b num_head^ l^ hd^ -> b num_head^ l^ hd^')(vs_attn_forward)
-
 
 def test_dense_pattern():
     context_size = 131072

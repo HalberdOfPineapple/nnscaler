@@ -68,17 +68,21 @@ def _fwd_kernel(
     # initialize offsets
     offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
     offs_n = tl.arange(0, BLOCK_N)
+
     # initialize pointer to m and l
     m_i = tl.zeros([BLOCK_M], dtype=tl.float32) - float("inf")
     l_i = tl.zeros([BLOCK_M], dtype=tl.float32)
     acc = tl.zeros([BLOCK_M, BLOCK_DMODEL], dtype=tl.float32)
+
     # scale sm_scale by log_2(e) and use
     # 2^x instead of exp in the loop because CSE and LICM
     # don't work as expected with `exp` in the loop
     qk_scale = sm_scale * 1.44269504
+
     # load q: it will stay in SRAM throughout
     q = tl.load(Q_block_ptr)
     q = (q * qk_scale).to(tl.float16)
+
     # loop over k, v and update accumulator
     lo = 0
     hi = P_SEQ + (start_m + 1) * BLOCK_M if IS_CAUSAL else N_CTX + P_SEQ
@@ -86,21 +90,26 @@ def _fwd_kernel(
         # -- load k, v --
         k = tl.load(K_block_ptr)
         v = tl.load(V_block_ptr)
+
         # -- compute qk ---
         qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float16)
         if IS_CAUSAL:
             qk = tl.where(P_SEQ + offs_m[:, None] >= (start_n + offs_n[None, :]), qk, float("-inf"))
         qk += tl.dot(q, k, out_dtype=tl.float16)
+
         # -- compute scaling constant ---
         m_i_new = tl.maximum(m_i, tl.max(qk, 1))
         alpha = tl.math.exp2(m_i - m_i_new)
         p = tl.math.exp2(qk - m_i_new[:, None])
+
         # -- scale and update acc --
         acc *= alpha[:, None]
         acc += tl.dot(p.to(tl.float16), v)
+
         # -- update m_i and l_i --
         l_i = l_i * alpha + tl.sum(p, 1)
         m_i = m_i_new
+
         # update pointers
         K_block_ptr = tl.advance(K_block_ptr, (0, BLOCK_N))
         V_block_ptr = tl.advance(V_block_ptr, (BLOCK_N, 0))
@@ -265,6 +274,15 @@ class _attention(torch.autograd.Function):
             IS_CAUSAL=causal,
             num_warps=num_warps,
             num_stages=num_stages)
+        
+        with torch.no_grad():
+            softmax_lse_ = torch.zeros((q.shape[0], q.shape[1], q.shape[2]), dtype=torch.float32, device=q.device)
+            s = q @ k.transpose(-1, -2) * sm_scale
+            softmax_lse_ += torch.log2(torch.sum(torch.exp(s), dim=-1))
+            if torch.allclose(L, softmax_lse_, atol=5e-2, rtol=5e-2):
+                print(f"{__name__} Softmax LSE correctly calculated")
+            else:
+                print(f"{__name__} Softmax LSE incorrectly calculated")
 
         ctx.save_for_backward(q, k, v, o, L)
         ctx.grid = grid
@@ -342,75 +360,73 @@ def test_op(Z, H, N_CTX, D_HEAD, P_SEQ, causal, dtype=torch.float16):
     assert torch.allclose(ref_dk, tri_dk, atol=1e-2, rtol=0)
     assert torch.allclose(ref_dq, tri_dq, atol=1e-2, rtol=0)
 
-
-try:
-    from flash_attn.flash_attn_interface import \
-        flash_attn_qkvpacked_func as flash_attn_func
-    FLASH_VER = 2
-except BaseException:
+if __name__ == "__main__":
     try:
-        from flash_attn.flash_attn_interface import flash_attn_func
-        FLASH_VER = 1
+        from flash_attn.flash_attn_interface import \
+            flash_attn_qkvpacked_func as flash_attn_func
+        FLASH_VER = 2
     except BaseException:
-        FLASH_VER = None
-HAS_FLASH = FLASH_VER is not None
+        try:
+            from flash_attn.flash_attn_interface import flash_attn_func
+            FLASH_VER = 1
+        except BaseException:
+            FLASH_VER = None
+    HAS_FLASH = FLASH_VER is not None
 
-BATCH, N_HEADS, N_CTX, D_HEAD = 4, 48, 4096, 64
-# vary seq length for fixed head and batch=4
-configs = [triton.testing.Benchmark(
-    x_names=['N_CTX'],
-    x_vals=[2**i for i in range(10, 15)],
-    line_arg='provider',
-    line_vals=['triton'] + (['flash'] if HAS_FLASH else []),
-    line_names=['Triton'] + ([f'Flash-{FLASH_VER}'] if HAS_FLASH else []),
-    styles=[('red', '-'), ('blue', '-')],
-    ylabel='ms',
-    plot_name=f'fused-attention-batch{BATCH}-head{N_HEADS}-d{D_HEAD}-{mode}',
-    args={'H': N_HEADS, 'BATCH': BATCH, 'D_HEAD': D_HEAD, 'dtype': torch.float16, 'mode': mode, 'causal': causal}
-) for mode in ['fwd', 'bwd'] for causal in [False, True]]
+    BATCH, N_HEADS, N_CTX, D_HEAD = 4, 48, 4096, 64
+    # vary seq length for fixed head and batch=4
+    configs = [triton.testing.Benchmark(
+        x_names=['N_CTX'],
+        x_vals=[2**i for i in range(10, 15)],
+        line_arg='provider',
+        line_vals=['triton'] + (['flash'] if HAS_FLASH else []),
+        line_names=['Triton'] + ([f'Flash-{FLASH_VER}'] if HAS_FLASH else []),
+        styles=[('red', '-'), ('blue', '-')],
+        ylabel='ms',
+        plot_name=f'fused-attention-batch{BATCH}-head{N_HEADS}-d{D_HEAD}-{mode}',
+        args={'H': N_HEADS, 'BATCH': BATCH, 'D_HEAD': D_HEAD, 'dtype': torch.float16, 'mode': mode, 'causal': causal}
+    ) for mode in ['fwd', 'bwd'] for causal in [False, True]]
 
-
-@triton.testing.perf_report(configs)
-def bench_flash_attention(BATCH, H, N_CTX, D_HEAD, causal, mode, provider, dtype=torch.float16, device="cuda"):
-    assert mode in ['fwd', 'bwd']
-    warmup = 25
-    rep = 100
-    if provider == "triton":
-        q = torch.randn((BATCH, H, N_CTX, D_HEAD), dtype=dtype, device="cuda", requires_grad=True)
-        k = torch.randn((BATCH, H, N_CTX, D_HEAD), dtype=dtype, device="cuda", requires_grad=True)
-        v = torch.randn((BATCH, H, N_CTX, D_HEAD), dtype=dtype, device="cuda", requires_grad=True)
-        sm_scale = 1.3
-        fn = lambda: attention(q, k, v, causal, sm_scale)
+    @triton.testing.perf_report(configs)
+    def bench_flash_attention(BATCH, H, N_CTX, D_HEAD, causal, mode, provider, dtype=torch.float16, device="cuda"):
+        assert mode in ['fwd', 'bwd']
+        warmup = 25
+        rep = 100
+        if provider == "triton":
+            q = torch.randn((BATCH, H, N_CTX, D_HEAD), dtype=dtype, device="cuda", requires_grad=True)
+            k = torch.randn((BATCH, H, N_CTX, D_HEAD), dtype=dtype, device="cuda", requires_grad=True)
+            v = torch.randn((BATCH, H, N_CTX, D_HEAD), dtype=dtype, device="cuda", requires_grad=True)
+            sm_scale = 1.3
+            fn = lambda: attention(q, k, v, causal, sm_scale)
+            if mode == 'bwd':
+                o = fn()
+                do = torch.randn_like(o)
+                fn = lambda: o.backward(do, retain_graph=True)
+            ms = triton.testing.do_bench(fn, warmup=warmup, rep=rep)
+        if provider == "flash":
+            qkv = torch.randn((BATCH, N_CTX, 3, H, D_HEAD), dtype=dtype, device=device, requires_grad=True)
+            if FLASH_VER == 1:
+                lengths = torch.full((BATCH,), fill_value=N_CTX, device=device)
+                cu_seqlens = torch.zeros((BATCH + 1,), device=device, dtype=torch.int32)
+                cu_seqlens[1:] = lengths.cumsum(0)
+                qkv = qkv.reshape(BATCH * N_CTX, 3, H, D_HEAD)
+                fn = lambda: flash_attn_func(qkv, cu_seqlens, 0., N_CTX, causal=causal)
+            elif FLASH_VER == 2:
+                fn = lambda: flash_attn_func(qkv, causal=causal)
+            else:
+                raise ValueError(f'unknown {FLASH_VER = }')
+            if mode == 'bwd':
+                o = fn()
+                do = torch.randn_like(o)
+                fn = lambda: o.backward(do, retain_graph=True)
+            ms = triton.testing.do_bench(fn, warmup=warmup, rep=rep)
+        flops_per_matmul = 2. * BATCH * H * N_CTX * N_CTX * D_HEAD
+        total_flops = 2 * flops_per_matmul
+        if causal:
+            total_flops *= 0.5
         if mode == 'bwd':
-            o = fn()
-            do = torch.randn_like(o)
-            fn = lambda: o.backward(do, retain_graph=True)
-        ms = triton.testing.do_bench(fn, warmup=warmup, rep=rep)
-    if provider == "flash":
-        qkv = torch.randn((BATCH, N_CTX, 3, H, D_HEAD), dtype=dtype, device=device, requires_grad=True)
-        if FLASH_VER == 1:
-            lengths = torch.full((BATCH,), fill_value=N_CTX, device=device)
-            cu_seqlens = torch.zeros((BATCH + 1,), device=device, dtype=torch.int32)
-            cu_seqlens[1:] = lengths.cumsum(0)
-            qkv = qkv.reshape(BATCH * N_CTX, 3, H, D_HEAD)
-            fn = lambda: flash_attn_func(qkv, cu_seqlens, 0., N_CTX, causal=causal)
-        elif FLASH_VER == 2:
-            fn = lambda: flash_attn_func(qkv, causal=causal)
-        else:
-            raise ValueError(f'unknown {FLASH_VER = }')
-        if mode == 'bwd':
-            o = fn()
-            do = torch.randn_like(o)
-            fn = lambda: o.backward(do, retain_graph=True)
-        ms = triton.testing.do_bench(fn, warmup=warmup, rep=rep)
-    flops_per_matmul = 2. * BATCH * H * N_CTX * N_CTX * D_HEAD
-    total_flops = 2 * flops_per_matmul
-    if causal:
-        total_flops *= 0.5
-    if mode == 'bwd':
-        total_flops *= 2.5  # 2.0(bwd) + 0.5(recompute)
-    return total_flops / ms * 1e-9
+            total_flops *= 2.5  # 2.0(bwd) + 0.5(recompute)
+        return total_flops / ms * 1e-9
 
-
-# only works on post-Ampere GPUs right now
-bench_flash_attention.run(save_path='.', print_data=True)
+    # only works on post-Ampere GPUs right now
+    bench_flash_attention.run(save_path='.', print_data=True)

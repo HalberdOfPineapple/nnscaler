@@ -8,7 +8,17 @@ from flash_attn.flash_attn_interface import _flash_attn_forward
 import triton
 import triton.language as tl
 
+from fa_ref import attention as RefAttention
+
 LN2 = 1 / 1.44269504
+ATOL, RTOL = 5e-2, 5e-2
+
+def pad_tensor(x, context_size, head_dim, block_size):
+    # Pad to context_length dimension (N_CTX) to be divisible by BLOCK_SIZE_M
+    seq_pad = ((context_size + block_size - 1) // block_size) * block_size - context_size
+    dim_pad = 2 ** math.ceil(math.log2(head_dim)) - head_dim
+    x_pad = torch.nn.functional.pad(x, [0, dim_pad, 0, seq_pad, 0, 0, 0, 0])
+    return x_pad
 
 
 @triton.jit
@@ -156,19 +166,15 @@ def _triton_mixed_sparse_attn_fwd_kernel(
     softmax_lse_ptr = softmax_lse + offs_lse[:, None]
 
     # log(sum(exp(qk - m_i))) = log(sum(exp(qk)) * exp(-m_i)) = log(sum(exp(qk))) - m_i
-    softmax_lse_vals = tl.math.log(l_i) + m_i * LN2
+    # softmax_lse_vals = tl.math.log(l_i) + m_i * LN2
+    softmax_lse_vals = tl.math.log2(l_i) + m_i
     # softmax_lse_vals = (tl.math.log2(l_i) + m_i) / 1.44269504  # Remove it on MInference backward
 
     # directly use log because the scale has been applied to q, which makes values in softmax equivalent to exp(x/sqrt(d_model))
     tl.store(softmax_lse_ptr, softmax_lse_vals.to(dtype)[:, None], mask=m_mask) 
 
 
-def pad_tensor(x, context_size, head_dim, block_size):
-    # Pad to context_length dimension (N_CTX) to be divisible by BLOCK_SIZE_M
-    seq_pad = ((context_size + block_size - 1) // block_size) * block_size - context_size
-    dim_pad = 2 ** math.ceil(math.log2(head_dim)) - head_dim
-    x_pad = torch.nn.functional.pad(x, [0, dim_pad, 0, seq_pad, 0, 0, 0, 0])
-    return x_pad
+
 
 def _triton_mixed_sparse_attention(
     q: torch.Tensor,          # [BATCH, N_HEADS, N_CTX, D_HEAD]
@@ -185,8 +191,6 @@ def _triton_mixed_sparse_attention(
     block_size_M: int = 64,
     block_size_N: int = 64,
 ) -> torch.Tensor:
-    q, k, v = pad_tensor(q, context_size, head_dim, block_size_M), pad_tensor(k, context_size, head_dim, block_size_M), pad_tensor(v, context_size, head_dim, block_size_M)
-
     # shape constraints
     Lq, Lk, Lv = q.shape[-1], k.shape[-1], v.shape[-1]
     assert Lq == Lk and Lk == Lv
@@ -222,14 +226,6 @@ def _triton_mixed_sparse_attention(
     )
 
     return o, softmax_lse
-
-
-# grid: (triton.cdiv(q.shape[2], block_size_M), q.shape[0] * q.shape[1], 1)
-# D = torch.sum(grad_o * o, dim=-1)
-# @triton.jit
-# def _triton_bwd_D(
-    
-# )
 
 def _triton_mixed_sparse_attention_bwd(
     q: torch.Tensor,          # [BATCH, N_HEADS, N_CTX, D_HEAD]
@@ -288,12 +284,10 @@ def gen_block_indices(
             q[:, :, -last_q:, :].contiguous(), # [BATCH, N_HEADS, LAST_Q, D_HEAD]
             k, # [BATCH, N_HEADS, N_CTX, D_HEAD]
         ) / math.sqrt(head_dim) # [BATCH, N_HEADS, LAST_Q, N_CTX]
-        print(f"qk shape: {qk.shape}")
 
         # LAST_Q_MASK: torch.Size([1, 1, 64, 64])
         # qk[:, :, :, -last_q:] = torch.where(LAST_Q_MASK[...,-last_q:,-last_q:].to(q.device), qk[:, :, :, -last_q:], -torch.inf)
         last_q_mask = LAST_Q_MASK[..., -last_q:, -last_q:].clone().to(q.device)
-        print(f"last_q_mask shape: {last_q_mask.shape}")
 
         qk[:, :, :, -last_q:] = torch.where(last_q_mask, qk[:, :, :, -last_q:], -torch.inf)
 
@@ -370,19 +364,37 @@ class MFCB(torch.autograd.Function):
         ctx.context_size = context_size
         ctx.head_dim = head_dim
 
+        query, key, value = (
+            pad_tensor(query, context_size, head_dim, block_size_M), 
+            pad_tensor(key, context_size, head_dim, block_size_M), 
+            pad_tensor(value, context_size, head_dim, block_size_M)
+        )
+
         # the input version of Q, K and V are padded to be divisible by BLOCK_SIZE_M
         # the output and softmax_lse are also padded
         sm_scale = head_dim ** -0.5
-        o_pad, softmax_lse = _triton_mixed_sparse_attention(
+
+        torch.cuda.synchronize()
+        print(f"Sign before MF kernel...", end=' ')
+        o, softmax_lse = _triton_mixed_sparse_attention(
             query, key, value, seqlens,
             block_count, block_offset, column_count, column_index,
             sm_scale, context_size, head_dim,
             block_size_M, block_size_N,
         )
-        o = o_pad[..., :context_size, :, :head_dim]
+        print(f"Done.")
+        torch.cuda.synchronize()
 
-        ctx.save_for_backward(query, key, value, o, softmax_lse[:, :, :context_size].contiguous())
-        ctx.head_dim = head_dim
+        torch.cuda.synchronize()
+        print(f"Sign before saving tensors...", end=' ')
+        ctx.save_for_backward(
+            query, key, value, o, softmax_lse
+        )
+        print(f"Done.")
+        torch.cuda.synchronize()
+        
+        ctx.block_size_M = block_size_M
+        ctx.block_size_N = block_size_N
         return o
     
     @staticmethod
@@ -390,7 +402,8 @@ class MFCB(torch.autograd.Function):
         # softmax_lse: [batch_size, num_heads, context_size]
         q, k, v, o, softmax_lse = ctx.saved_tensors
 
-        head_dim = ctx.head_dim
+
+        context_size, head_dim = ctx.context_size, ctx.head_dim
         sm_scale = 1.0 / (head_dim ** 0.5)
 
         s = q @ k.transpose(-1, -2) * sm_scale
@@ -410,10 +423,135 @@ class MFCB(torch.autograd.Function):
         dq = ds @ k * sm_scale
         dk = ds.transpose(-1, -2) @ q * sm_scale
 
-        return dq, dk, dv, None, None, None, None, None
+        return dq[:, :, :context_size, :head_dim], dk[:, :, :context_size, :head_dim], dv[:, :, :context_size, :head_dim], None, None, None, None, None
 
 
-class MFFB(torch.autograd.Function):
+@triton.jit
+def _bwd_preprocess(
+    Out, DO,
+    Delta,
+    BLOCK_M: tl.constexpr, D_HEAD: tl.constexpr,
+):
+    off_m = tl.program_id(0) * BLOCK_M + tl.arange(0, BLOCK_M)
+    off_n = tl.arange(0, D_HEAD)
+    # load
+    o = tl.load(Out + off_m[:, None] * D_HEAD + off_n[None, :]).to(tl.float32)
+    do = tl.load(DO + off_m[:, None] * D_HEAD + off_n[None, :]).to(tl.float32)
+    # compute
+    delta = tl.sum(o * do, axis=1)
+    # write-back
+    tl.store(Delta + off_m, delta)
+
+
+@triton.jit
+def _bwd_kernel(
+    Q, K, V, 
+    sm_scale, context_size,
+    Out, DO,
+    DQ, DK, DV,
+    L,
+    D,
+    stride_qz, stride_qh, stride_qm, stride_qk,
+    stride_kz, stride_kh, stride_kn, stride_kk,
+    stride_vz, stride_vh, stride_vk, stride_vn,
+    Z, H, N_CTX, P_SEQ,
+    num_block_q, num_block_kv,
+    BLOCK_M: tl.constexpr, BLOCK_DMODEL: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    CAUSAL: tl.constexpr,
+):
+    off_hz = tl.program_id(0)
+    off_z = off_hz // H
+    off_h = off_hz % H
+    qk_scale = sm_scale * 1.44269504
+    # offset pointers for batch/head
+    Q += off_z * stride_qz + off_h * stride_qh
+    K += off_z * stride_kz + off_h * stride_kh
+    V += off_z * stride_vz + off_h * stride_vh
+    DO += off_z * stride_qz + off_h * stride_qh
+    DQ += off_z * stride_qz + off_h * stride_qh
+    DK += off_z * stride_kz + off_h * stride_kh
+    DV += off_z * stride_vz + off_h * stride_vh
+    for start_n in range(0, num_block_kv):
+        if CAUSAL:
+            lo = tl.math.max(start_n * BLOCK_M - P_SEQ, 0)
+        else:
+            lo = 0
+        # initialize row/col offsets
+        offs_qm = lo + tl.arange(0, BLOCK_M)
+        offs_n = start_n * BLOCK_M + tl.arange(0, BLOCK_M)
+        offs_m = tl.arange(0, BLOCK_N)
+        offs_k = tl.arange(0, BLOCK_DMODEL)
+        # initialize pointers to value-like data
+        q_ptrs = Q + (offs_qm[:, None] * stride_qm + offs_k[None, :] * stride_qk)
+        k_ptrs = K + (offs_n[:, None] * stride_kn + offs_k[None, :] * stride_kk)
+        v_ptrs = V + (offs_n[:, None] * stride_qm + offs_k[None, :] * stride_qk)
+        do_ptrs = DO + (offs_qm[:, None] * stride_qm + offs_k[None, :] * stride_qk)
+        dq_ptrs = DQ + (offs_qm[:, None] * stride_qm + offs_k[None, :] * stride_qk)
+        # pointer to row-wise quantities in value-like data
+        D_ptrs = D + off_hz * N_CTX
+        l_ptrs = L + off_hz * N_CTX
+        # initialize dk amd dv
+        dk = tl.zeros([BLOCK_M, BLOCK_DMODEL], dtype=tl.float32)
+        dv = tl.zeros([BLOCK_M, BLOCK_DMODEL], dtype=tl.float32)
+        # k and v stay in SRAM throughout
+        k = tl.load(k_ptrs)
+        v = tl.load(v_ptrs)
+        # loop over rows
+        for start_m in range(lo, num_block_q * BLOCK_M, BLOCK_M):
+            offs_m_curr = start_m + offs_m
+            # load q, k, v, do on-chip
+            q = tl.load(q_ptrs)
+            # recompute p = softmax(qk, dim=-1).T
+            if CAUSAL:
+                causal_mask = (P_SEQ + offs_m_curr[:, None]) >= (offs_n[None, :])
+                m_mask = offs_m_curr[:, None] < context_size
+                qk = tl.where(causal_mask & m_mask, float(0.), float("-inf"))
+            else:
+                qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
+            qk += tl.dot(q, tl.trans(k))
+            qk *= qk_scale
+            l_i = tl.load(l_ptrs + offs_m_curr)
+            p = tl.math.exp2(qk - l_i[:, None])
+
+            # compute dv
+            do = tl.load(do_ptrs)
+            dv += tl.dot(tl.trans(p.to(Q.dtype.element_ty)), do)
+
+            
+            # compute dp = dot(v, do)
+            Di = tl.load(D_ptrs + offs_m_curr)
+            dp = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32) - Di[:, None]
+            dp += tl.dot(do, tl.trans(v))
+            # compute ds = p * (dp - delta[:, None])
+            ds = p * dp * sm_scale
+            # compute dk = dot(ds.T, q)
+            dk += tl.dot(tl.trans(ds.to(Q.dtype.element_ty)), q)
+            # compute dq
+            dq = tl.load(dq_ptrs)
+            dq += tl.dot(ds.to(Q.dtype.element_ty), k)
+            tl.store(dq_ptrs, dq)
+            # increment pointers
+            dq_ptrs += BLOCK_M * stride_qm
+            q_ptrs += BLOCK_M * stride_qm
+            do_ptrs += BLOCK_M * stride_qm
+        # write-back
+        dk_ptrs = DK + (offs_n[:, None] * stride_kn + offs_k[None, :] * stride_kk)
+        dv_ptrs = DV + (offs_n[:, None] * stride_qm + offs_k[None, :] * stride_qk)
+        tl.store(dk_ptrs, dk)
+        tl.store(dv_ptrs, dv)
+
+def pad_tensor(x, context_size, head_dim, block_size):
+    # Pad to context_length dimension (N_CTX) to be divisible by BLOCK_SIZE_M
+    seq_pad = ((context_size + block_size - 1) // block_size) * block_size - context_size
+    dim_pad = 2 ** math.ceil(math.log2(head_dim)) - head_dim
+    if x.dim() == 4:
+        x_pad = torch.nn.functional.pad(x, [0, dim_pad, 0, 0, 0, seq_pad, 0, 0])
+    else:
+        x_pad = torch.nn.functional.pad(x, [0, seq_pad, 0, 0, 0, 0])
+    return x_pad
+
+class MFRB(torch.autograd.Function):
     @staticmethod
     def forward(
         ctx, 
@@ -430,86 +568,101 @@ class MFFB(torch.autograd.Function):
         # the input version of Q, K and V are padded to be divisible by BLOCK_SIZE_M
         # the output and softmax_lse are also padded
         sm_scale = head_dim ** -0.5
-        o_pad, softmax_lse = _triton_mixed_sparse_attention(
+
+        query, key, value = (
+            pad_tensor(query, context_size, head_dim, block_size_M), 
+            pad_tensor(key, context_size, head_dim, block_size_M), 
+            pad_tensor(value, context_size, head_dim, block_size_M)
+        )
+
+        torch.cuda.synchronize()
+        print(f"Sign before MF kernel...", end=' ')
+        o, softmax_lse = _triton_mixed_sparse_attention(
             query, key, value, seqlens,
             block_count, block_offset, column_count, column_index,
             sm_scale, context_size, head_dim,
             block_size_M, block_size_N,
         )
-        o = o_pad[..., :context_size, :, :head_dim]
+        print(f"Done.")
+        torch.cuda.synchronize()
 
-        # Manually recompute softmax_lse:
-        s = query @ key.transpose(-1, -2) * sm_scale
-        softmax_lse = torch.logsumexp(s, dim=-1)
-
-        ctx.save_for_backward(query, key, value, o, softmax_lse[:, :, :context_size].contiguous())
-        ctx.head_dim = head_dim
+        torch.cuda.synchronize()
+        print(f"Sign before saving tensors...", end=' ')
+        ctx.save_for_backward(
+            query, key, value, o, softmax_lse
+        )
+        print(f"Done.")
+        torch.cuda.synchronize()
+        
         ctx.block_size_M = block_size_M
         ctx.block_size_N = block_size_N
         return o
     
     @staticmethod
-    def backward(ctx, grad_o):
-        # softmax_lse: [batch_size, num_heads, context_size]
-        q, k, v, o, softmax_lse = ctx.saved_tensors
+    def backward(ctx, do):
+        q, k, v, o, L = ctx.saved_tensors
         block_size_M, block_size_N = ctx.block_size_M, ctx.block_size_N
-        head_dim = ctx.head_dim
+        head_dim, context_size = ctx.head_dim, ctx.context_size
         sm_scale = 1.0 / (head_dim ** 0.5)
 
-        D = torch.sum(grad_o * o, dim=-1).to(softmax_lse.dtype)
+        print('-' * 20)
+        grid = (triton.cdiv(q.shape[2], block_size_M), q.shape[0] * q.shape[1], 1)
 
-        dq, dk, dv = torch.zeros_like(q), torch.zeros_like(k), torch.zeros_like(v)
+        do = do.contiguous()
+        dq = torch.zeros_like(q, dtype=torch.float32)
+        dk = torch.empty_like(k)
+        dv = torch.empty_like(v)
+        delta = torch.empty_like(L)
 
-        context_size = q.shape[-2]
-        Tr, Tc = (context_size + block_size_M - 1) // block_size_M, (context_size + block_size_N - 1) // block_size_N
-        for j in range(Tc):
-            col_max = min((j + 1) * block_size_N, context_size) 
-            kj, vj = k[:, :, j * block_size_N:col_max, :], v[:, :, j * block_size_N:col_max, :]
-            for i in range(Tr):
-                row_max = min((i + 1) * block_size_M, context_size)
-                if row_max <= j * block_size_N: continue
-                
-                qi = q[:, :, i * block_size_M:row_max, :]
-                doi = grad_o[:, :, i * block_size_M:row_max, :]
-                li, di = softmax_lse[:, :, i * block_size_M:row_max], D[:, :, i * block_size_M:row_max]
+        torch.cuda.synchronize()
+        print(f"Sign before BWD preprocess kernel...", end=' ')
+        _bwd_preprocess[(grid[0] * grid[1], )](
+            o, do,
+            delta,
+            BLOCK_M=block_size_M, 
+            D_HEAD=q.shape[-1],
+        )
+        print(f"Done.")
+        torch.cuda.synchronize()
 
-                q_arange = torch.arange(i * block_size_M, row_max, device='cuda')
-                k_arange = torch.arange(j * block_size_N, col_max, device='cuda')
-                causal_mask = k_arange[None, :] <= q_arange[:, None]
+        D = torch.sum(do * o, dim=-1).to(L.dtype)
+        if not torch.allclose(delta, D, atol=ATOL, rtol=RTOL):
+            print(f"Triton-calculated Delta is not close to D")
+        else:
+            print(f"Delta correctly calculated")
 
-                sij = torch.zeros((q.shape[0], q.shape[1], qi.shape[2], kj.shape[2]), dtype=torch.float32, device=q.device)
-                sij = torch.where(causal_mask, sij, torch.full_like(sij, float('-inf'))).to(q.dtype)
-                sij = (sij + qi @ kj.transpose(-1, -2)) * sm_scale
-                pij = torch.exp(sij - li[:, :, :, None])
-                
-                # -------------
-                # Calculate dV
-                dv[:, :, j * block_size_N:col_max, :] += pij.to(q.dtype).transpose(-1, -2) @ doi
-
-                # -------------
-                # Calculate dP = dO @ V^T
-                dpij = torch.zeros((q.shape[0], q.shape[1], qi.shape[2], kj.shape[2]), dtype=torch.float32, device=q.device) - di[:, :, :, None]
-                dpij = dpij + (doi @ vj.transpose(-1, -2))
-
-                # -------------
-                # Calculate dS = P * (dP - sum(P * dP, dim=-1, keepdim=True))
-                dsij = pij * dpij * sm_scale
-
-                # -------------
-                # Calculate dKj = dS^T @ Qi
-                dk[:, :, j * block_size_N:col_max, :] += dsij.transpose(-1, -2).to(q.dtype) @ qi
-                dq[:, :, i * block_size_M:row_max, :] += dsij.to(q.dtype) @ kj
-
-
-        return dq, dk, dv, None, None, None, None, None
+        torch.cuda.synchronize()
+        print(f"Sign before BWD kernel...", end=' ')
+        _bwd_kernel[(grid[1],)](
+            q, k, v,
+            sm_scale,
+            context_size,
+            o, do,
+            dq, dk, dv,
+            L, delta,
+            q.stride(0), q.stride(1), q.stride(2), q.stride(3),
+            k.stride(0), k.stride(1), k.stride(2), k.stride(3),
+            v.stride(0), v.stride(1), v.stride(2), v.stride(3),
+            q.shape[0], q.shape[1], q.shape[2], 0,
+            grid[0], triton.cdiv(k.shape[2], block_size_N),
+            BLOCK_M=block_size_M, 
+            BLOCK_N=block_size_N,
+            BLOCK_DMODEL=q.shape[-1], 
+            CAUSAL=True,
+            num_warps=8,
+            num_stages=1,
+        )
+        print(f"Done.")
+        torch.cuda.synchronize()
 
 
+        return dq[..., :context_size, :head_dim], dk[..., :context_size, :head_dim], dv[..., :context_size, :head_dim], None, None, None, None, None
 
 def main(args):
     torch.manual_seed(1024)
     mode: str = args.mode
 
-    context_size = 256 # 131072
+    context_size = args.context_size
     num_heads = 1 # 32
     head_dim = 96
 
@@ -518,31 +671,27 @@ def main(args):
     v = torch.randn((1, num_heads, context_size, head_dim), dtype=torch.float16, device='cuda', requires_grad=True)
 
     # --------------------------------------------------------------------------------
-    # Standard FA Library for reference
-    q.retain_grad()
-    k.retain_grad()
-    v.retain_grad()
-
-    # o_ref: torch.Tensor = flash_attn_func(
-    #     q.transpose(1, 2),
-    #     k.transpose(1, 2),
-    #     v.transpose(1, 2),
-    #     dropout_p=0.0,
-    #     softmax_scale=None,
-    #     causal=True,
-    # )
-    # o_ref = o_ref.transpose(1, 2)
     vertical_size = 100
     slash_size = context_size
     block_count, block_offset, column_count, column_index, seqlens = gen_block_indices(
         q, k, v, context_size, vertical_size, slash_size, head_dim
     )
 
-    o_ref = MFCB.apply(
-        q, k, v,
-        block_count, block_offset, column_count, column_index,
-        seqlens
+    # --------------------------------------------------------------------------------
+    # Standard FA Library for reference
+    q.retain_grad()
+    k.retain_grad()
+    v.retain_grad()
+
+    o_ref = flash_attn_func(
+        q.transpose(1, 2),
+        k.transpose(1, 2),
+        v.transpose(1, 2),
+        dropout_p=0.0,
+        softmax_scale=None,
+        causal=True,
     )
+    o_ref = o_ref.transpose(1, 2)
     o_ref.retain_grad()
 
     print(f"o_ref shape: {o_ref.shape}")
@@ -560,37 +709,46 @@ def main(args):
     k.grad.zero_()
     v.grad.zero_()
 
-
-
     # --------------------------------------------------------------------------------
     # Custom Attention
     if mode == "naive":
         o = CustomAttn.apply(q, k, v, context_size, head_dim)
-        o = o.transpose(1, 2)
     elif mode == "mfcb":
-        vertical_size = 100
-        slash_size = context_size
-        block_count, block_offset, column_count, column_index, seqlens = gen_block_indices(
-            q, k, v, context_size, vertical_size, slash_size, head_dim
-        )
-
         o = MFCB.apply(
             q, k, v,
             block_count, block_offset, column_count, column_index,
             seqlens
         )
-    elif mode == "mffb":
-        vertical_size = 100
-        slash_size = context_size
-        block_count, block_offset, column_count, column_index, seqlens = gen_block_indices(
-            q, k, v, context_size, vertical_size, slash_size, head_dim
+        o = o[..., :, :context_size, :head_dim]
+    elif mode == "FA":
+        o = flash_attn_func(
+            q.transpose(1, 2),
+            k.transpose(1, 2),
+            v.transpose(1, 2),
+            dropout_p=0.0,
+            softmax_scale=None,
+            causal=True,
         )
-
-        o = MFFB.apply(
-            q, k, v,  
+        o = o.transpose(1, 2)
+    elif mode == "mfrb":
+        o = MFRB.apply(
+            q, k, v,
             block_count, block_offset, column_count, column_index,
             seqlens
         )
+        o = o[..., :, :context_size, :head_dim]
+    elif mode == "ref":
+        q_pad = pad_tensor(q, context_size, head_dim, 64)
+        k_pad = pad_tensor(k, context_size, head_dim, 64)
+        v_pad = pad_tensor(v, context_size, head_dim, 64)
+        o = RefAttention(
+            q_pad, k_pad, v_pad,
+            True,
+            1.0 / (head_dim ** 0.5),
+        )
+        o = o[..., :, :context_size, :head_dim]
+    else:
+        raise ValueError(f"Invalid mode: {mode}")
 
     q.retain_grad()
     k.retain_grad()
@@ -614,14 +772,14 @@ def main(args):
 
 
     # --------------------------------------------------------------------------------
-    atol, rtol = 5e-2, 5e-2
+    
     for head_idx in range(num_heads):
         print('-' * 40)
-        output_close = torch.allclose(o[0, head_idx, :, :], o_ref[0, head_idx, :, :], atol=atol, rtol=rtol)
-        output_grad_close = torch.allclose(o_grad[0, head_idx, :, :], o_ref_grad[0, head_idx, :, :], atol=atol, rtol=rtol)
-        q_grad_close = torch.allclose(q_grad[0, head_idx, :, :], q_ref_grad[0, head_idx, :, :], atol=atol, rtol=rtol)
-        k_grad_close = torch.allclose(k_grad[0, head_idx, :, :], k_ref_grad[0, head_idx, :, :], atol=atol, rtol=rtol)
-        v_grad_close = torch.allclose(v_grad[0, head_idx, :, :], v_ref_grad[0, head_idx, :, :], atol=atol, rtol=rtol)
+        output_close = torch.allclose(o[0, head_idx, :, :], o_ref[0, head_idx, :, :], atol=ATOL, rtol=RTOL)
+        output_grad_close = torch.allclose(o_grad[0, head_idx, :, :], o_ref_grad[0, head_idx, :, :], atol=ATOL, rtol=RTOL)
+        q_grad_close = torch.allclose(q_grad[0, head_idx, :, :], q_ref_grad[0, head_idx, :, :], atol=ATOL, rtol=RTOL)
+        k_grad_close = torch.allclose(k_grad[0, head_idx, :, :], k_ref_grad[0, head_idx, :, :], atol=ATOL, rtol=RTOL)
+        v_grad_close = torch.allclose(v_grad[0, head_idx, :, :], v_ref_grad[0, head_idx, :, :], atol=ATOL, rtol=RTOL)
 
         if not output_close: 
             print('-' * 20)
@@ -649,5 +807,6 @@ def main(args):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('-m', '--mode', type=str, default='naive')
+    parser.add_argument('-n', '--context_size', type=int, default=256)
     args = parser.parse_args()
     main(args)
