@@ -178,23 +178,28 @@ def _bwd_kernel(
             lo = tl.math.max(start_n * BLOCK_M - P_SEQ, 0)
         else:
             lo = 0
+            
         # initialize row/col offsets
         offs_qm = lo + tl.arange(0, BLOCK_M)
         offs_n = start_n * BLOCK_M + tl.arange(0, BLOCK_M)
         offs_m = tl.arange(0, BLOCK_N)
         offs_k = tl.arange(0, BLOCK_DMODEL)
+
         # initialize pointers to value-like data
         q_ptrs = Q + (offs_qm[:, None] * stride_qm + offs_k[None, :] * stride_qk)
         k_ptrs = K + (offs_n[:, None] * stride_kn + offs_k[None, :] * stride_kk)
         v_ptrs = V + (offs_n[:, None] * stride_qm + offs_k[None, :] * stride_qk)
         do_ptrs = DO + (offs_qm[:, None] * stride_qm + offs_k[None, :] * stride_qk)
         dq_ptrs = DQ + (offs_qm[:, None] * stride_qm + offs_k[None, :] * stride_qk)
+
         # pointer to row-wise quantities in value-like data
         D_ptrs = D + off_hz * N_CTX
         l_ptrs = L + off_hz * N_CTX
+
         # initialize dk amd dv
         dk = tl.zeros([BLOCK_M, BLOCK_DMODEL], dtype=tl.float32)
         dv = tl.zeros([BLOCK_M, BLOCK_DMODEL], dtype=tl.float32)
+
         # k and v stay in SRAM throughout
         k = tl.load(k_ptrs)
         v = tl.load(v_ptrs)
