@@ -17,7 +17,11 @@ def pad_tensor(x, context_size, head_dim, block_size):
     # Pad to context_length dimension (N_CTX) to be divisible by BLOCK_SIZE_M
     seq_pad = ((context_size + block_size - 1) // block_size) * block_size - context_size
     dim_pad = 2 ** math.ceil(math.log2(head_dim)) - head_dim
-    x_pad = torch.nn.functional.pad(x, [0, dim_pad, 0, seq_pad, 0, 0, 0, 0])
+
+    if x.dim() == 4:
+        x_pad = torch.nn.functional.pad(x, [0, dim_pad, 0, seq_pad, 0, 0, 0, 0])
+    else:
+        x_pad = torch.nn.functional.pad(x, [0, seq_pad, 0, 0, 0, 0])
     return x_pad
 
 
@@ -167,8 +171,7 @@ def _triton_mixed_sparse_attn_fwd_kernel(
 
     # log(sum(exp(qk - m_i))) = log(sum(exp(qk)) * exp(-m_i)) = log(sum(exp(qk))) - m_i
     # softmax_lse_vals = tl.math.log(l_i) + m_i * LN2
-    softmax_lse_vals = tl.math.log2(l_i) + m_i
-    # softmax_lse_vals = (tl.math.log2(l_i) + m_i) / 1.44269504  # Remove it on MInference backward
+    softmax_lse_vals = tl.math.log2(l_i) + m_i # The core difference is that softmax_lse is still logged with base two
 
     # directly use log because the scale has been applied to q, which makes values in softmax equivalent to exp(x/sqrt(d_model))
     tl.store(softmax_lse_ptr, softmax_lse_vals.to(dtype)[:, None], mask=m_mask) 
@@ -207,6 +210,8 @@ def _triton_mixed_sparse_attention(
         device=q.device
     )
 
+    # torch.cuda.synchronize()
+    # print(f'Sign before sparse kernel..', end=' ')
     _triton_mixed_sparse_attn_fwd_kernel[grid](
         q, k, v, seqlens, sm_scale,
         block_count, block_offset, column_count, column_index,
@@ -224,40 +229,8 @@ def _triton_mixed_sparse_attention(
         dtype=dtype,
         num_warps=4, num_stages=2,
     )
-
-    return o, softmax_lse
-
-def _triton_mixed_sparse_attention_bwd(
-    q: torch.Tensor,          # [BATCH, N_HEADS, N_CTX, D_HEAD]
-    k: torch.Tensor,          # [BATCH, N_HEADS, N_CTX, D_HEAD]
-    v: torch.Tensor,          # [BATCH, N_HEADS, N_CTX, D_HEAD]
-    o: torch.Tensor,          # [BATCH, N_HEADS, N_CTX, D_HEAD]
-    do: torch.Tensor,         # [BATCH, N_HEADS, N_CTX, D_HEAD]
-    softmax_lse: torch.Tensor, # [BATCH, N_HEADS, N_CTX]
-    seqlens: torch.Tensor,    # [BATCH, ]
-    block_count: torch.Tensor,  # [BATCH, N_HEADS, cdiv(N_CTX, BLOCK_SIZE_M)]
-    block_offset: torch.Tensor,  # [BATCH, N_HEADS, cdiv(N_CTX, BLOCK_SIZE_M), NNZ_S]
-    column_count: torch.Tensor,  # [BATCH, N_HEADS, cdiv(N_CTX, BLOCK_SIZE_M)]
-    column_index: torch.Tensor,  # [BATCH, N_HEADS, cdiv(N_CTX, BLOCK_SIZE_M), NNZ_V]
-    sm_scale: float,
-    context_size: int,
-    head_dim: int,
-    block_size_M: int = 64,
-    block_size_N: int = 64,
-) -> torch.Tensor:
-    q, k, v = pad_tensor(q, context_size, head_dim, block_size_M), pad_tensor(k, context_size, head_dim, block_size_M), pad_tensor(v, context_size, head_dim, block_size_M)
-
-    # shape constraints
-    Lq, Lk, Lv = q.shape[-1], k.shape[-1], v.shape[-1]
-    assert Lq == Lk and Lk == Lv
-    assert Lk in {16, 32, 64, 128}
-    o = torch.zeros_like(q)
-    
-    grid = (triton.cdiv(q.shape[2], block_size_M), q.shape[0] * q.shape[1], 1)
-    dtype = tl.bfloat16 if q.dtype == torch.bfloat16 else tl.float16
-
-    # TODO: Implement the backward kernel
-
+    # print('Done')
+    # torch.cuda.synchronize()
 
     return o, softmax_lse
 
@@ -374,24 +347,15 @@ class MFCB(torch.autograd.Function):
         # the output and softmax_lse are also padded
         sm_scale = head_dim ** -0.5
 
-        torch.cuda.synchronize()
-        print(f"Sign before MF kernel...", end=' ')
         o, softmax_lse = _triton_mixed_sparse_attention(
             query, key, value, seqlens,
             block_count, block_offset, column_count, column_index,
             sm_scale, context_size, head_dim,
             block_size_M, block_size_N,
         )
-        print(f"Done.")
-        torch.cuda.synchronize()
-
-        torch.cuda.synchronize()
-        print(f"Sign before saving tensors...", end=' ')
         ctx.save_for_backward(
             query, key, value, o, softmax_lse
         )
-        print(f"Done.")
-        torch.cuda.synchronize()
         
         ctx.block_size_M = block_size_M
         ctx.block_size_N = block_size_N
@@ -541,16 +505,6 @@ def _bwd_kernel(
         tl.store(dk_ptrs, dk)
         tl.store(dv_ptrs, dv)
 
-def pad_tensor(x, context_size, head_dim, block_size):
-    # Pad to context_length dimension (N_CTX) to be divisible by BLOCK_SIZE_M
-    seq_pad = ((context_size + block_size - 1) // block_size) * block_size - context_size
-    dim_pad = 2 ** math.ceil(math.log2(head_dim)) - head_dim
-    if x.dim() == 4:
-        x_pad = torch.nn.functional.pad(x, [0, dim_pad, 0, 0, 0, seq_pad, 0, 0])
-    else:
-        x_pad = torch.nn.functional.pad(x, [0, seq_pad, 0, 0, 0, 0])
-    return x_pad
-
 class MFRB(torch.autograd.Function):
     @staticmethod
     def forward(
@@ -575,24 +529,15 @@ class MFRB(torch.autograd.Function):
             pad_tensor(value, context_size, head_dim, block_size_M)
         )
 
-        torch.cuda.synchronize()
-        print(f"Sign before MF kernel...", end=' ')
         o, softmax_lse = _triton_mixed_sparse_attention(
             query, key, value, seqlens,
             block_count, block_offset, column_count, column_index,
             sm_scale, context_size, head_dim,
             block_size_M, block_size_N,
         )
-        print(f"Done.")
-        torch.cuda.synchronize()
-
-        torch.cuda.synchronize()
-        print(f"Sign before saving tensors...", end=' ')
         ctx.save_for_backward(
             query, key, value, o, softmax_lse
         )
-        print(f"Done.")
-        torch.cuda.synchronize()
         
         ctx.block_size_M = block_size_M
         ctx.block_size_N = block_size_N
@@ -614,25 +559,19 @@ class MFRB(torch.autograd.Function):
         dv = torch.empty_like(v)
         delta = torch.empty_like(L)
 
-        torch.cuda.synchronize()
-        print(f"Sign before BWD preprocess kernel...", end=' ')
         _bwd_preprocess[(grid[0] * grid[1], )](
             o, do,
             delta,
             BLOCK_M=block_size_M, 
             D_HEAD=q.shape[-1],
         )
-        print(f"Done.")
-        torch.cuda.synchronize()
 
-        D = torch.sum(do * o, dim=-1).to(L.dtype)
-        if not torch.allclose(delta, D, atol=ATOL, rtol=RTOL):
-            print(f"Triton-calculated Delta is not close to D")
-        else:
-            print(f"Delta correctly calculated")
+        # D = torch.sum(do * o, dim=-1).to(L.dtype)
+        # if not torch.allclose(delta, D, atol=ATOL, rtol=RTOL):
+        #     print(f"Triton-calculated Delta is not close to D")
+        # else:
+        #     print(f"Delta correctly calculated")
 
-        torch.cuda.synchronize()
-        print(f"Sign before BWD kernel...", end=' ')
         _bwd_kernel[(grid[1],)](
             q, k, v,
             sm_scale,
@@ -652,11 +591,10 @@ class MFRB(torch.autograd.Function):
             num_warps=8,
             num_stages=1,
         )
-        print(f"Done.")
-        torch.cuda.synchronize()
 
 
         return dq[..., :context_size, :head_dim], dk[..., :context_size, :head_dim], dv[..., :context_size, :head_dim], None, None, None, None, None
+
 
 def main(args):
     torch.manual_seed(1024)
@@ -737,6 +675,7 @@ def main(args):
             seqlens
         )
         o = o[..., :, :context_size, :head_dim]
+        # o = mfrb(q, k, v, seqlens, context_size, head_dim)
     elif mode == "ref":
         q_pad = pad_tensor(q, context_size, head_dim, 64)
         k_pad = pad_tensor(k, context_size, head_dim, 64)
