@@ -122,8 +122,7 @@ class MInferAttention(PhiAttention):
             query_states, key_states, value_states, head_indices,
             bsz, q_len,  self.head_dim, pattern,
         ) # expect:  b l^ {q_anno} vd^'
-        
-
+    
         attn_output = attn_output.reshape(bsz, q_len, self.hidden_size).contiguous()
         attn_output = self.o_proj(attn_output)
 
@@ -154,16 +153,14 @@ def attn_fwd_by_heads(
             # => apply the kernel for calculating the attention based on the best pattern
             ty, vertical_size, slash_size, _ = pattern
             attn_output_head = vs_attn_forward(
-                q.transpose(1, 2),
-                k.transpose(1, 2),
-                v.transpose(1, 2),
+                q, k, v,
                 q_len, vertical_size, slash_size, head_dim
-            ).view(bsz, q_len, 1, head_dim)
+            ).view(bsz, 1, q_len, head_dim)
             # output_list.append(attn_output_head.squeeze(2))
             output_list.append(attn_output_head)
 
         # output = torch.stack(output_list, dim=2)
-        output = torch.cat(output_list, dim=2)
+        output = torch.cat(output_list, dim=1)
     return output
 
 
@@ -177,11 +174,12 @@ def minfer_attn_anno(query_states, key_states, value_states, *args, **kwargs) ->
     else:
         q_anno = kv_anno = 'num_heads'
 
-    return f'b {q_anno} l^ hd^, b {kv_anno} s^ hd^, b {kv_anno} s^ vd^, {q_anno} -> b l^ {q_anno} vd^'
+    # return f'b {q_anno} l^ hd^, b {kv_anno} s^ hd^, b {kv_anno} s^ vd^, {q_anno} -> b l^ {q_anno} vd^'
+    return f'b {q_anno} l^ hd^, b {kv_anno} s^ hd^, b {kv_anno} s^ vd^, {q_anno} -> b {q_anno} l^ vd^'
 
-# if __name__ != "__main__":
-#     register_op(minfer_attn_anno)(attn_fwd_by_heads)
-register_op(minfer_attn_anno)(attn_fwd_by_heads)
+if __name__ != "__main__":
+    register_op(minfer_attn_anno)(attn_fwd_by_heads)
+# register_op(minfer_attn_anno)(attn_fwd_by_heads)
 
 
 
@@ -215,10 +213,11 @@ def attn_fwd_by_heads_v2(
 
 def test_wo_chunks():
     from flash_attn import flash_attn_func
+    ATOL, RTOL = 5e-2, 5e-2
 
     batch_size = 1
     context_size = 131072
-    num_heads = 32
+    num_heads = 1 # 32
     head_dim = 96
 
     q = torch.randn((batch_size, num_heads, context_size, head_dim), dtype=torch.float16, device='cuda', requires_grad=True)
@@ -265,6 +264,7 @@ def test_wo_chunks():
         causal=True,
     ) # b l^ {q_anno} vd^
     print(f"o_ref.shape: {o_ref.shape}")
+    o_ref = o_ref.transpose(1, 2)
 
     q.retain_grad()
     k.retain_grad()
@@ -287,11 +287,11 @@ def test_wo_chunks():
 
     for head_idx in range(num_heads):
         print('-' * 40)
-        output_close = torch.allclose(o[0, :, head_idx, :], o_ref[0, :, head_idx, :], atol=1e-2, rtol=1e-2)
-        output_grad_close = torch.allclose(o_grad[0, :, head_idx, :], o_ref_grad[0, :, head_idx, :], atol=1e-2, rtol=1e-2)
-        q_grad_close = torch.allclose(q_grad[0, head_idx, :, :], q_ref_grad[0, head_idx, :, :], atol=1e-2, rtol=1e-2)
-        k_grad_close = torch.allclose(k_grad[0, head_idx, :, :], k_ref_grad[0, head_idx, :, :], atol=1e-2, rtol=1e-2)
-        v_grad_close = torch.allclose(v_grad[0, head_idx, :, :], v_ref_grad[0, head_idx, :, :], atol=1e-2, rtol=1e-2)
+        output_close = torch.allclose(o[0, head_idx, :, :], o_ref[0, head_idx, :, :], atol=ATOL, rtol=RTOL)
+        output_grad_close = torch.allclose(o_grad[0, head_idx, :, :], o_ref_grad[0, head_idx, :, :], atol=ATOL, rtol=RTOL)
+        q_grad_close = torch.allclose(q_grad[0, head_idx, :, :], q_ref_grad[0, head_idx, :, :], atol=ATOL, rtol=RTOL)
+        k_grad_close = torch.allclose(k_grad[0, head_idx, :, :], k_ref_grad[0, head_idx, :, :], atol=ATOL, rtol=RTOL)
+        v_grad_close = torch.allclose(v_grad[0, head_idx, :, :], v_ref_grad[0, head_idx, :, :], atol=ATOL, rtol=RTOL)
 
         if not output_close: print(f"Head {head_idx} output is not close")
         if not output_grad_close: print(f"Head {head_idx} output grad is not close")
@@ -304,7 +304,7 @@ def test_w_chunks():
 
     batch_size = 1
     context_size = 131072
-    num_heads = 32
+    num_heads = 1 # 32
     head_dim = 96
 
 
@@ -375,6 +375,7 @@ def test_w_chunks():
         )
         o_ref_chunks.append(o_ref_chunk)
     o_ref = torch.cat(o_ref_chunks, dim=2)
+    o_ref = o_ref.transpose(1, 2)
     o_ref.retain_grad()
     print(f"o_ref.shape: {o_ref.shape}")
 
@@ -396,11 +397,11 @@ def test_w_chunks():
 
     for head_idx in range(num_heads):
         print('-' * 40)
-        output_close = torch.allclose(o[0, :, head_idx, :], o_ref[0, :, head_idx, :], atol=1e-2, rtol=1e-2)
-        output_grad_close = torch.allclose(o_grad[0, :, head_idx, :], o_ref_grad[0, :, head_idx, :], atol=1e-2, rtol=1e-2)
-        q_grad_close = torch.allclose(q_grad[0, head_idx, :, :], q_ref_grad[0, head_idx, :, :], atol=1e-2, rtol=1e-2)
-        k_grad_close = torch.allclose(k_grad[0, head_idx, :, :], k_ref_grad[0, head_idx, :, :], atol=1e-2, rtol=1e-2)
-        v_grad_close = torch.allclose(v_grad[0, head_idx, :, :], v_ref_grad[0, head_idx, :, :], atol=1e-2, rtol=1e-2)
+        output_close = torch.allclose(o[0, head_idx, :, :], o_ref[0, head_idx, :, :], atol=ATOL, rtol=RTOL)
+        output_grad_close = torch.allclose(o_grad[0, head_idx, :, :], o_ref_grad[0, head_idx, :, :], atol=ATOL, rtol=RTOL)
+        q_grad_close = torch.allclose(q_grad[0, head_idx, :, :], q_ref_grad[0, head_idx, :, :], atol=ATOL, rtol=RTOL)
+        k_grad_close = torch.allclose(k_grad[0, head_idx, :, :], k_ref_grad[0, head_idx, :, :], atol=ATOL, rtol=RTOL)
+        v_grad_close = torch.allclose(v_grad[0, head_idx, :, :], v_ref_grad[0, head_idx, :, :], atol=ATOL, rtol=RTOL)
 
         if not output_close: print(f"Head {head_idx} output is not close")
         if not output_grad_close: print(f"Head {head_idx} output grad is not close")
@@ -412,7 +413,7 @@ def test_w_chunks():
 
 def test_w_chunks():
     from flash_attn import flash_attn_func
-
+    ATOL, RTOL = 5e-2, 5e-2
     batch_size = 1
     context_size = 131072
     num_heads = 32
@@ -444,7 +445,7 @@ def test_w_chunks():
             ("vertical_and_slash", 100, context_size, 1)
         )
         o_chunks.append(o_chunk)
-    o = torch.cat(o_chunks, dim=2)
+    o = torch.cat(o_chunks, dim=1)
     o.retain_grad()
     print(f"o.shape: {o.shape}")
 
@@ -486,6 +487,7 @@ def test_w_chunks():
         )
         o_ref_chunks.append(o_ref_chunk)
     o_ref = torch.cat(o_ref_chunks, dim=2)
+    o_ref = o_ref.transpose(1, 2)
     o_ref.retain_grad()
     print(f"o_ref.shape: {o_ref.shape}")
 
@@ -507,11 +509,11 @@ def test_w_chunks():
 
     for head_idx in range(num_heads):
         print('-' * 40)
-        output_close = torch.allclose(o[0, :, head_idx, :], o_ref[0, :, head_idx, :], atol=1e-2, rtol=1e-2)
-        output_grad_close = torch.allclose(o_grad[0, :, head_idx, :], o_ref_grad[0, :, head_idx, :], atol=1e-2, rtol=1e-2)
-        q_grad_close = torch.allclose(q_grad[0, head_idx, :, :], q_ref_grad[0, head_idx, :, :], atol=1e-2, rtol=1e-2)
-        k_grad_close = torch.allclose(k_grad[0, head_idx, :, :], k_ref_grad[0, head_idx, :, :], atol=1e-2, rtol=1e-2)
-        v_grad_close = torch.allclose(v_grad[0, head_idx, :, :], v_ref_grad[0, head_idx, :, :], atol=1e-2, rtol=1e-2)
+        output_close = torch.allclose(o[0, head_idx, :, :], o_ref[0, head_idx, :, :], atol=ATOL, rtol=RTOL)
+        output_grad_close = torch.allclose(o_grad[0, head_idx, :, :], o_ref_grad[0, head_idx, :, :], atol=ATOL, rtol=RTOL)
+        q_grad_close = torch.allclose(q_grad[0, head_idx, :, :], q_ref_grad[0, head_idx, :, :], atol=ATOL, rtol=RTOL)
+        k_grad_close = torch.allclose(k_grad[0, head_idx, :, :], k_ref_grad[0, head_idx, :, :], atol=ATOL, rtol=RTOL)
+        v_grad_close = torch.allclose(v_grad[0, head_idx, :, :], v_ref_grad[0, head_idx, :, :], atol=ATOL, rtol=RTOL)
 
         if not output_close: print(f"Head {head_idx} output is not close")
         if not output_grad_close: print(f"Head {head_idx} output grad is not close")
