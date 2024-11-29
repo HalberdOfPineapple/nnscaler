@@ -179,9 +179,6 @@ def minfer_attn_anno(query_states, key_states, value_states, *args, **kwargs) ->
 
 if __name__ != "__main__":
     register_op(minfer_attn_anno)(attn_fwd_by_heads)
-# register_op(minfer_attn_anno)(attn_fwd_by_heads)
-
-
 
 def attn_fwd_by_heads_v2(
     query_states: torch.Tensor,
@@ -211,6 +208,9 @@ def attn_fwd_by_heads_v2(
     torch.cuda.synchronize()
     return output
 
+
+
+# -----------------------------------------------------------
 def test_wo_chunks():
     from flash_attn import flash_attn_func
     ATOL, RTOL = 5e-2, 5e-2
@@ -354,8 +354,6 @@ def test_w_chunks():
     print(f"q_grad.shape: {q_grad.shape}")
     print(f"k_grad.shape: {k_grad.shape}")
     print(f"v_grad.shape: {v_grad.shape}")
-
-
 
 
     # ---------------------------------
@@ -515,12 +513,35 @@ def test_w_chunks():
         k_grad_close = torch.allclose(k_grad[0, head_idx, :, :], k_ref_grad[0, head_idx, :, :], atol=ATOL, rtol=RTOL)
         v_grad_close = torch.allclose(v_grad[0, head_idx, :, :], v_ref_grad[0, head_idx, :, :], atol=ATOL, rtol=RTOL)
 
-        if not output_close: print(f"Head {head_idx} output is not close")
-        if not output_grad_close: print(f"Head {head_idx} output grad is not close")
-        if not q_grad_close: print(f"Head {head_idx} q grad is not close")
-        if not k_grad_close: print(f"Head {head_idx} k grad is not close")
-        if not v_grad_close: print(f"Head {head_idx} v grad is not close")
+        if not output_close: 
+            print('-' * 20)
+            if not output_close: print(f"Head {head_idx} output is not close")
+            print(f"Output:\n{o[0, head_idx, :, :]}")
+            print(f"Output Ref:\n{o_ref[0, head_idx, :, :]}")
 
+        if not output_grad_close: 
+            print('-' * 20)
+            if not output_grad_close: print(f"Head {head_idx} output grad is not close")
+            print(f"Output:\n{o_grad[0, head_idx, :, :]}")
+            print(f"Output Ref:\n{o_ref_grad[0, head_idx, :, :]}")
+
+        if not q_grad_close: 
+            print('-' * 20)
+            if not q_grad_close: print(f"Head {head_idx} q grad is not close")
+            print(f"Q Grad:\n{q_grad[0, head_idx, :, :]}")
+            print(f"Q Grad Ref:\n{q_ref_grad[0, head_idx, :, :]}")
+        
+        if not k_grad_close: 
+            print('-' * 20)
+            if not k_grad_close: print(f"Head {head_idx} k grad is not close")
+            print(f"K Grad:\n{k_grad[0, head_idx, :, :]}")
+            print(f"K Grad Ref:\n{k_ref_grad[0, head_idx, :, :]}")
+
+        if not v_grad_close: 
+            print('-' * 20)
+            if not v_grad_close: print(f"Head {head_idx} v grad is not close")
+            print(f"V Grad:\n{v_grad[0, head_idx, :, :]}")
+            print(f"V Grad Ref:\n{v_ref_grad[0, head_idx, :, :]}")
 
 if __name__ == "__main__":
     # print('-' * 80)

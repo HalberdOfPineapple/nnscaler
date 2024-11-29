@@ -171,9 +171,6 @@ def _mbwd_kernel(
         k = tl.load(k_ptrs)
         v = tl.load(v_ptrs)
 
-        dk_ptrs = DK + (cols[:, None] * stride_kn + offs_k[None, :] * stride_kk)
-        dv_ptrs = DV + (cols[:, None] * stride_vn + offs_k[None, :] * stride_vk)
-
         if CAUSAL:
             causal_mask = (P_SEQ + offs_m[:, None]) >= (cols[None, :])
             qk = tl.where(causal_mask & m_mask, float(0.), float("-inf")).to(tl.float32)
@@ -185,18 +182,20 @@ def _mbwd_kernel(
         p = tl.math.exp2(qk - l_i[:, None])
 
         # compute dv
-        dv_vals = tl.dot(tl.trans(p.to(Q.dtype.element_ty)), do).to(tl.float16)
+        dv_ptrs = DV + (cols[:, None] * stride_vn + offs_k[None, :] * stride_vk)
+        dv_vals = tl.dot(tl.trans(p.to(Q.dtype.element_ty)), do)
         tl.atomic_add(dv_ptrs, dv_vals)
 
         # compute dp = dot(v, do)
         dp = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32) - D_i[:, None]
         dp += tl.dot(do, tl.trans(v))
-        
+
         # compute ds = p * (dp - delta[:, None])
         ds = p * dp * sm_scale
 
         # compute dk = dot(ds.T, q)
-        dk_vals = tl.dot(tl.trans(ds.to(Q.dtype.element_ty)), q).to(tl.float16)
+        dk_ptrs = DK + (cols[:, None] * stride_kn + offs_k[None, :] * stride_kk)
+        dk_vals = tl.dot(tl.trans(ds.to(Q.dtype.element_ty)), q)
         tl.atomic_add(dk_ptrs, dk_vals)
 
         # compute dq
@@ -206,40 +205,40 @@ def _mbwd_kernel(
         # the key difference is that cols, as the indices, are stored in and loaded from cols_ptr
         # At each iteration, a block-sized chunk of column **indices** are loaded from cols_ptr, which can be discontinuous
         # But we just load the indices block by block, equivalent to translating the non-sparse columns together
-        n_mask = (start_n + offs_n < num_cols)[:, None]
-        cols = tl.load(cols_ptr + start_n + offs_n[:, None], mask=n_mask, other=0)
+        n_mask = (start_n + offs_n < num_cols)
+        cols = tl.load(cols_ptr + start_n + offs_n, mask=n_mask, other=0)
 
         # -- load k, v --
-        k_ptrs  = K + (cols * stride_kn + offs_k[None, :] * stride_kk)
-        v_ptrs = V + (cols * stride_vn + offs_k[None, :] * stride_vk)
-        k = tl.load(k_ptrs, mask=n_mask, other=0.)
-        v = tl.load(v_ptrs, mask=n_mask, other=0.)
+        k_ptrs = K + (cols[:, None] * stride_kn + offs_k[None, :] * stride_kk)
+        v_ptrs = V + (cols[:, None] * stride_vn + offs_k[None, :] * stride_vk)
+        k = tl.load(k_ptrs, mask=n_mask[:, None], other=0.)
+        v = tl.load(v_ptrs, mask=n_mask[:, None], other=0.)
 
         # Computer qk
         qk = tl.where(m_mask & n_mask, float(0.), float("-inf"))
-        qk += tl.dot(q, tl.trans(k))
-        qk *= qk_scale
+        qk = qk + tl.dot(q, tl.trans(k))
+        qk = qk * qk_scale
         p = tl.math.exp2(qk - l_i[:, None])
 
         # compute dv
-        dv_ptrs = DV + (cols * stride_vn + offs_k[None] * stride_vk)
-        dv_vals = tl.dot(tl.trans(p.to(Q.dtype.element_ty)), do).to(tl.float16)
+        dv_ptrs = DV + (cols[:, None] * stride_vn + offs_k[None] * stride_vk)
+        dv_vals = tl.dot(tl.trans(p.to(Q.dtype.element_ty)), do)
         tl.atomic_add(dv_ptrs, dv_vals)
 
         # compute dp = dot(v, do)
         dp = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32) - D_i[:, None]
-        dp += tl.dot(do, tl.trans(v))
+        dp = dp + tl.dot(do, tl.trans(v))
         
         # compute ds = p * (dp - delta[:, None])
         ds = p * dp * sm_scale
 
         # compute dk = dot(ds.T, q)
-        dk_ptrs = DK + (cols * stride_kn + offs_k[None, :] * stride_kk)
-        dk_vals = tl.dot(tl.trans(ds.to(Q.dtype.element_ty)), q).to(tl.float16)
+        dk_ptrs = DK + (cols[:, None] * stride_kn + offs_k[None, :] * stride_kk)
+        dk_vals = tl.dot(tl.trans(ds.to(Q.dtype.element_ty)), q)
         tl.atomic_add(dk_ptrs, dk_vals)
 
         # compute dq
-        dq += tl.dot(ds.to(Q.dtype.element_ty), k)
+        dq = dq + tl.dot(ds.to(Q.dtype.element_ty), k)
 
     dq_ptrs = DQ + (offs_m[:, None] * stride_qm + offs_k[None, :] * stride_qk)
     tl.store(dq_ptrs, dq)

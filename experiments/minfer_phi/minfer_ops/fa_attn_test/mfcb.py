@@ -141,8 +141,8 @@ class MFCBMask(torch.autograd.Function):
                     block_off = block_offset[batch_idx, head_idx, block_idx, :]
                     for block_idx in range(block_cnt):
                         start_n = block_off[block_idx]
-                        for row in rows:
-                            for col_idx in range(start_n, min(start_n+block_size_N, context_size)):
+                        for col_idx in range(start_n, min(start_n+block_size_N, context_size)):
+                            for row in rows:                        
                                 sparse_mask[batch_idx, head_idx, row, col_idx] = True
                     
                     column_cnt = column_count[batch_idx, head_idx, block_idx]
@@ -150,8 +150,8 @@ class MFCBMask(torch.autograd.Function):
                     columns = column_idx[:column_cnt].cpu().numpy()
 
                     print(f"batch_idx: {batch_idx}, head_idx: {head_idx}, rows: {rows}, columns: {columns}")
-                    for row in rows:
-                        for col in columns:
+                    for col in columns:
+                        for row in rows:                    
                             sparse_mask[batch_idx, head_idx, row, col] = True
         print(f"sparse_mask\n: {sparse_mask}")
 

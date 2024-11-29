@@ -220,8 +220,8 @@ def main(args):
     if args.minfer_type == MInferType.BASELINE:
         print(f"{__name__} | (Expr 0) Using Baseline Model...")
         nnscaler_phi_init()
-    elif args.minfer_type == MInferType.MF_DB:
-        print(f"{__name__} | (Expr 1) Using MInference Forward with Dense Backward...")
+    else:
+        print(f"{__name__} | (Expr 3) Using MInference-equipped Model ...")
         minfer_phi_init()
 
     minfer_config_path = os.path.join(MINFER_CONFIG_DIR, f'{args.name}.yaml')

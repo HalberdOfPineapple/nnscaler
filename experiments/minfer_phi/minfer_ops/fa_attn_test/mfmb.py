@@ -1,3 +1,5 @@
+import os
+import pdb
 import torch
 import triton
 import triton.language as tl
@@ -81,9 +83,6 @@ def _mbwd_kernel(
         k = tl.load(k_ptrs)
         v = tl.load(v_ptrs)
 
-        dk_ptrs = DK + (cols[:, None] * stride_kn + offs_k[None, :] * stride_kk)
-        dv_ptrs = DV + (cols[:, None] * stride_vn + offs_k[None, :] * stride_vk)
-
         if CAUSAL:
             causal_mask = (P_SEQ + offs_m[:, None]) >= (cols[None, :])
             qk = tl.where(causal_mask & m_mask, float(0.), float("-inf")).to(tl.float32)
@@ -95,17 +94,21 @@ def _mbwd_kernel(
         p = tl.math.exp2(qk - l_i[:, None])
 
         # compute dv
-        tl.atomic_add(dv_ptrs, tl.dot(tl.trans(p.to(Q.dtype.element_ty)), do))
+        dv_ptrs = DV + (cols[:, None] * stride_vn + offs_k[None, :] * stride_vk)
+        dv_vals = tl.dot(tl.trans(p.to(Q.dtype.element_ty)), do)
+        tl.atomic_add(dv_ptrs, dv_vals)
 
         # compute dp = dot(v, do)
         dp = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32) - D_i[:, None]
         dp += tl.dot(do, tl.trans(v))
-        
+
         # compute ds = p * (dp - delta[:, None])
         ds = p * dp * sm_scale
 
         # compute dk = dot(ds.T, q)
-        tl.atomic_add(dk_ptrs, tl.dot(tl.trans(ds.to(Q.dtype.element_ty)), q))
+        dk_ptrs = DK + (cols[:, None] * stride_kn + offs_k[None, :] * stride_kk)
+        dk_vals = tl.dot(tl.trans(ds.to(Q.dtype.element_ty)), q)
+        tl.atomic_add(dk_ptrs, dk_vals)
 
         # compute dq
         dq += tl.dot(ds.to(Q.dtype.element_ty), k)
@@ -114,38 +117,40 @@ def _mbwd_kernel(
         # the key difference is that cols, as the indices, are stored in and loaded from cols_ptr
         # At each iteration, a block-sized chunk of column **indices** are loaded from cols_ptr, which can be discontinuous
         # But we just load the indices block by block, equivalent to translating the non-sparse columns together
-        n_mask = (start_n + offs_n < num_cols)[:, None]
-        cols = tl.load(cols_ptr + start_n + offs_n[:, None], mask=n_mask, other=0)
+        n_mask = (start_n + offs_n < num_cols)
+        cols = tl.load(cols_ptr + start_n + offs_n, mask=n_mask, other=0)
 
         # -- load k, v --
-        k_ptrs  = K + (cols * stride_kn + offs_k[None, :] * stride_kk)
-        v_ptrs = V + (cols * stride_vn + offs_k[None, :] * stride_vk)
-        k = tl.load(k_ptrs, mask=n_mask, other=0.)
-        v = tl.load(v_ptrs, mask=n_mask, other=0.)
+        k_ptrs = K + (cols[:, None] * stride_kn + offs_k[None, :] * stride_kk)
+        v_ptrs = V + (cols[:, None] * stride_vn + offs_k[None, :] * stride_vk)
+        k = tl.load(k_ptrs, mask=n_mask[:, None], other=0.)
+        v = tl.load(v_ptrs, mask=n_mask[:, None], other=0.)
 
         # Computer qk
         qk = tl.where(m_mask & n_mask, float(0.), float("-inf"))
-        qk += tl.dot(q, tl.trans(k))
-        qk *= qk_scale
+        qk = qk + tl.dot(q, tl.trans(k))
+        qk = qk * qk_scale
         p = tl.math.exp2(qk - l_i[:, None])
 
         # compute dv
-        dv_ptrs = DV + (cols * stride_vn + offs_k[None] * stride_vk)
-        tl.atomic_add(dv_ptrs, tl.dot(tl.trans(p.to(Q.dtype.element_ty)), do),)
+        dv_ptrs = DV + (cols[:, None] * stride_vn + offs_k[None] * stride_vk)
+        dv_vals = tl.dot(tl.trans(p.to(Q.dtype.element_ty)), do)
+        tl.atomic_add(dv_ptrs, dv_vals)
 
         # compute dp = dot(v, do)
         dp = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32) - D_i[:, None]
-        dp += tl.dot(do, tl.trans(v))
+        dp = dp + tl.dot(do, tl.trans(v))
         
         # compute ds = p * (dp - delta[:, None])
         ds = p * dp * sm_scale
 
         # compute dk = dot(ds.T, q)
-        dk_ptrs = DK + (cols * stride_kn + offs_k[None, :] * stride_kk)
-        tl.atomic_add(dk_ptrs, tl.dot(tl.trans(ds.to(Q.dtype.element_ty)), q))
+        dk_ptrs = DK + (cols[:, None] * stride_kn + offs_k[None, :] * stride_kk)
+        dk_vals = tl.dot(tl.trans(ds.to(Q.dtype.element_ty)), q)
+        tl.atomic_add(dk_ptrs, dk_vals)
 
         # compute dq
-        dq += tl.dot(ds.to(Q.dtype.element_ty), k)
+        dq = dq + tl.dot(ds.to(Q.dtype.element_ty), k)
 
     dq_ptrs = DQ + (offs_m[:, None] * stride_qm + offs_k[None, :] * stride_qk)
     tl.store(dq_ptrs, dq)
@@ -358,11 +363,15 @@ class MFMBTorch(torch.autograd.Function):
                     d_block = d[rows]
 
                     dq = torch.zeros([len(rows), D_MODEL]).to(DQ.dtype).to(query.device)
+
+                    # print(f"Row Block {block_m_idx} | ", end="")
                     for block_start_idx in range(block_cnt):
+                        # if block_start_idx == 0: print("Block Start Indices = [", end="")
                         start_n = block_off[block_start_idx]
+                        # print(f"{start_n}, ", end="")
+
                         cols = torch.arange(start_n, min(start_n + block_size_N, context_size), dtype=torch.int64).to(query.device)
                         k_block, v_block = k[cols, :], v[cols, :]
-                        
                         if causal:
                             causal_mask = (P_SEQ + rows[:, None]) >= cols[None, :]
                             qk = torch.where(causal_mask, torch.tensor(0.), torch.tensor(float("-inf"))).to(query.device).to(torch.float32)
@@ -381,15 +390,19 @@ class MFMBTorch(torch.autograd.Function):
 
                         ds = p * dp * sm_scale
                         DK[batch_idx, head_idx, cols, :] += torch.matmul(ds.transpose(-1, -2).to(query.dtype), q_block)
-                        print(f"Block start idx: {block_start_idx}, DK: {DK}")
 
                         dq += torch.matmul(ds.to(query.dtype), k_block)
+                    # print("]")
+                    
 
                     for start_n in range(0, col_cnt, block_size_N):
                         # cols will always load from within the range of (0, col_cnt) -> no need for n_mask to mask out the padded columns
+                        # if start_n == 0: print("Sparse Block Start Indices = [", end="")
+
                         cols = col_idx[start_n:min(start_n + block_size_N, col_cnt)]
                         k_block, v_block = k[cols, :], v[cols, :]
-                        # print(f"rows: {rows}, cols: {cols}")
+                        print(f"rows = {rows}, cols = {cols}")
+                        # print(f"{cols}, ", end="")
                         
                         qk = torch.zeros([len(rows), len(cols)]).to(query.device)
 
@@ -405,10 +418,9 @@ class MFMBTorch(torch.autograd.Function):
 
                         ds = p * dp * sm_scale
                         DK[batch_idx, head_idx, cols, :] += torch.matmul(ds.transpose(-1, -2).to(query.dtype), q_block)
-                        print(f"start_n: {start_n}, rows: {rows}, cols: {cols}, DK: {DK}")
 
                         dq += torch.matmul(ds.to(query.dtype), k_block)
-
+                    # print("]")
                     DQ[batch_idx, head_idx, rows, :] = dq
 
         return DQ[..., :context_size, :head_dim], DK[..., :context_size, :head_dim], DV[..., :context_size, :head_dim], None, None, None, None, None, None

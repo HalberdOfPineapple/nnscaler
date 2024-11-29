@@ -205,16 +205,15 @@ def main(args):
     print(f"Slash Size: {slash_size}")
     print('-' * 20)
     print(f"ATOL = {ATOL}, RTOL = {RTOL}")
-    # print('-' * 50)
+    print('-' * 50)
 
-    # q = torch.randn((1, num_heads, context_size, head_dim), dtype=torch.float16, device='cuda', requires_grad=True)
-    # k = torch.randn((1, num_heads, context_size, head_dim), dtype=torch.float16, device='cuda', requires_grad=True)
-    # v = torch.randn((1, num_heads, context_size, head_dim), dtype=torch.float16, device='cuda', requires_grad=True)
+    q = torch.randn((1, num_heads, context_size, head_dim), dtype=torch.float16, device='cuda', requires_grad=True)
+    k = torch.randn((1, num_heads, context_size, head_dim), dtype=torch.float16, device='cuda', requires_grad=True)
+    v = torch.randn((1, num_heads, context_size, head_dim), dtype=torch.float16, device='cuda', requires_grad=True)
 
-    factor = 1.
-    q = torch.ones((1, num_heads, context_size, head_dim), dtype=torch.float16, device='cuda', requires_grad=True)
-    k = torch.ones((1, num_heads, context_size, head_dim), dtype=torch.float16, device='cuda', requires_grad=True)
-    v = torch.ones((1, num_heads, context_size, head_dim), dtype=torch.float16, device='cuda', requires_grad=True)
+    # q = torch.ones((1, num_heads, context_size, head_dim), dtype=torch.float16, device='cuda', requires_grad=True)
+    # k = torch.ones((1, num_heads, context_size, head_dim), dtype=torch.float16, device='cuda', requires_grad=True)
+    # v = torch.ones((1, num_heads, context_size, head_dim), dtype=torch.float16, device='cuda', requires_grad=True)
 
     # --------------------------------------------------------------------------------
     # Generate block indices
@@ -325,45 +324,10 @@ def main(args):
             if not v_grad_close: print(f"Head {head_idx} v grad is not close")
             print(f"V Grad:\n{v_grad[0, head_idx, :, :]}")
             print(f"V Grad Ref:\n{v_ref_grad[0, head_idx, :, :]}")
-    
-    # --------------------------------------------------------------------------------
-    # print('-' * 80)
-    # print(f"Comparing sparse reference and {mode} attention")
-    # recovered_mask = torch.ones((context_size, context_size), dtype=torch.float16, device='cuda')
-    # q_grad_sr, k_grad_sr, v_grad_sr = sparse_multi_head_attention_backward_reference(
-    #     o_grad, o, q, k, v, 
-    #     recovered_mask,
-    #     transposed=True,
-    # )
-    
-    # for head_idx in range(num_heads):
-    #     print('-' * 40)
-    #     q_grad_close = torch.allclose(q_grad[0, head_idx, :, :], q_grad_sr[0, head_idx, :, :], atol=ATOL, rtol=RTOL)
-    #     k_grad_close = torch.allclose(k_grad[0, head_idx, :, :], k_grad_sr[0, head_idx, :, :], atol=ATOL, rtol=RTOL)
-    #     v_grad_close = torch.allclose(v_grad[0, head_idx, :, :], v_grad_sr[0, head_idx, :, :], atol=ATOL, rtol=RTOL)
-
-    #     if not q_grad_close or args.disable_val_equal: 
-    #         print('-' * 20)
-    #         if not q_grad_close: print(f"Head {head_idx} q grad is not close")
-    #         print(f"Q Grad:\n{q_grad[0, head_idx, :, :]}")
-    #         print(f"Q Grad Ref:\n{q_grad_sr[0, head_idx, :, :]}")
-        
-    #     if not k_grad_close or args.disable_val_equal: 
-    #         print('-' * 20)
-    #         if not k_grad_close: print(f"Head {head_idx} k grad is not close")
-    #         print(f"K Grad:\n{k_grad[0, head_idx, :, :]}")
-    #         print(f"K Grad Ref:\n{k_grad_sr[0, head_idx, :, :]}")
-
-    #     if not v_grad_close or args.disable_val_equal: 
-    #         print('-' * 20)
-    #         if not v_grad_close: print(f"Head {head_idx} v grad is not close")
-    #         print(f"V Grad:\n{v_grad[0, head_idx, :, :]}")
-    #         print(f"V Grad Ref:\n{v_grad_sr[0, head_idx, :, :]}")
-
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument('-m', '--mode', type=str, default='naive')
+    parser.add_argument('-m', '--mode', type=str, default='mfmb')
     parser.add_argument('-rm', '--ref_mode', type=str, default='FA')
     parser.add_argument('-nh', '--num_heads', type=int, default=1)
     parser.add_argument('-n', '--context_size', type=int, default=256)
