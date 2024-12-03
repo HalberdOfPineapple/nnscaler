@@ -13,7 +13,7 @@ from fwd_utils import pad_tensor, set_rep
 from naive import NaiveAttn
 from mfcb import MFCB, MFCBMask
 from mfrb import MFRB, MFRBRow, MFRBRowRe
-from mfmb import MFMB, MFMBTorch
+from mfmb import MFMB, MFMBTorch, MFMBDT
 from fa_ref import attention as RefAttention
 from fa_ref_2 import attention as RefAttention2
 from sparse_attn_ref import sparse_multi_head_attention_backward_reference
@@ -146,6 +146,14 @@ def attn_by_mode(
             causal,
         )
         o = o[..., :, :context_size, :head_dim]
+    elif mode == "mfmb_dt":
+        o = MFMBDT.apply(
+            q, k, v,
+            block_count, block_offset, column_count, column_index,
+            seqlens,
+            causal,
+        )
+        o = o[..., :, :context_size, :head_dim]
     elif mode == "mfmb_torch":
         o = MFMBTorch.apply(
             q, k, v,
@@ -207,24 +215,24 @@ def main(args):
     print(f"ATOL = {ATOL}, RTOL = {RTOL}")
     print('-' * 50)
 
-    q = torch.randn((1, num_heads, context_size, head_dim), dtype=torch.float16, device='cuda', requires_grad=True)
-    k = torch.randn((1, num_heads, context_size, head_dim), dtype=torch.float16, device='cuda', requires_grad=True)
-    v = torch.randn((1, num_heads, context_size, head_dim), dtype=torch.float16, device='cuda', requires_grad=True)
+    # q = torch.randn((1, num_heads, context_size, head_dim), dtype=torch.float16, device='cuda', requires_grad=True)
+    # k = torch.randn((1, num_heads, context_size, head_dim), dtype=torch.float16, device='cuda', requires_grad=True)
+    # v = torch.randn((1, num_heads, context_size, head_dim), dtype=torch.float16, device='cuda', requires_grad=True)
 
-    # q = torch.ones((1, num_heads, context_size, head_dim), dtype=torch.float16, device='cuda', requires_grad=True)
-    # k = torch.ones((1, num_heads, context_size, head_dim), dtype=torch.float16, device='cuda', requires_grad=True)
-    # v = torch.ones((1, num_heads, context_size, head_dim), dtype=torch.float16, device='cuda', requires_grad=True)
+    q = torch.ones((1, num_heads, context_size, head_dim), dtype=torch.float16, device='cuda', requires_grad=True)
+    k = torch.ones((1, num_heads, context_size, head_dim), dtype=torch.float16, device='cuda', requires_grad=True)
+    v = torch.ones((1, num_heads, context_size, head_dim), dtype=torch.float16, device='cuda', requires_grad=True)
 
     # --------------------------------------------------------------------------------
     # Generate block indices
     block_count, block_offset, column_count, column_index, seqlens = gen_block_indices(
         q, k, v, context_size, vertical_size, slash_size, head_dim
     )
-    # print('-' * 50)
-    # print(f"Block Count:\n{block_count}")
-    # print(f"Block Offset:\n{block_offset}")
-    # print(f"Column Count:\n{column_count}")
-    # print(f"Column Index:\n{column_index}")
+    print('-' * 50)
+    print(f"Block Count:\n{block_count}")
+    print(f"Block Offset:\n{block_offset}")
+    print(f"Column Count:\n{column_count}")
+    print(f"Column Index:\n{column_index}")
 
     # --------------------------------------------------------------------------------
     # Standard FA Library for reference

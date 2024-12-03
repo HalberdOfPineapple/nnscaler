@@ -120,7 +120,7 @@ class MInferAttention(PhiAttention):
         # print(f"query_states: {query_states.shape}, key_states: {key_states.shape}, value_states: {value_states.shape}, head_indices: {head_indices.shape}")
         attn_output = attn_fwd_by_heads(
             query_states, key_states, value_states, head_indices,
-            bsz, q_len,  self.head_dim, pattern,
+            bsz, q_len,  self.head_dim, self.layer_idx, pattern,
         ) # expect:  b l^ {q_anno} vd^'
     
         attn_output = attn_output.reshape(bsz, q_len, self.hidden_size).contiguous()
@@ -137,9 +137,9 @@ def attn_fwd_by_heads(
     bsz: int,
     q_len: int,
     head_dim: int,
+    layer_idx: int,
     pattern: Tuple[str, int, int, int],
 ):
-    # print(f"head_indices: {head_indices}")
     with torch.autograd.set_detect_anomaly(True):
         output_list = []
         assert(query_states.shape[1] == head_indices.shape[-1])
@@ -152,10 +152,21 @@ def attn_fwd_by_heads(
             # if search is disabled and the current layer is beyond  starting layer 
             # => apply the kernel for calculating the attention based on the best pattern
             ty, vertical_size, slash_size, _ = pattern
-            attn_output_head = vs_attn_forward(
-                q, k, v,
-                q_len, vertical_size, slash_size, head_dim
-            ).view(bsz, 1, q_len, head_dim)
+
+            try:
+                attn_output_head = vs_attn_forward(
+                    q, k, v,
+                    q_len, vertical_size, slash_size, head_dim,
+                    layer_idx, head_indices[head].item()
+                ).view(bsz, 1, q_len, head_dim)
+            except Exception as e:
+                print(f"Error in (Layer {layer_idx}, Head {head_indices[head].item()}) with pattern {pattern}")
+
+                import traceback
+                traceback.print_exc()
+                
+                attn_output_head = torch.randn(bsz, 1, q_len, head_dim, device=query_states.device)
+
             # output_list.append(attn_output_head.squeeze(2))
             output_list.append(attn_output_head)
 

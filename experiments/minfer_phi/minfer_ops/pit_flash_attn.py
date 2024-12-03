@@ -113,6 +113,9 @@ def _mbwd_kernel(
     stride_qz, stride_qh, stride_qm, stride_qk,
     stride_kz, stride_kh, stride_kn, stride_kk,
     stride_vz, stride_vh, stride_vn, stride_vk, 
+    stride_dqz, stride_dqh, stride_dqm, stride_dqk,
+    stride_dkz, stride_dkh, stride_dkn, stride_dkk,
+    stride_dvz, stride_dvh, stride_dvn, stride_dvk,
     Z, H, N_CTX, P_SEQ,
     num_block_q, num_block_kv, NNZ_S, NNZ_V,
     BLOCK_M: tl.constexpr, BLOCK_DMODEL: tl.constexpr,
@@ -121,6 +124,9 @@ def _mbwd_kernel(
 ):
     start_m = tl.program_id(0)
     off_hz = tl.program_id(1)
+    if start_m >= num_block_q or off_hz >= H * Z:
+        return
+
     off_z = off_hz // H
     off_h = off_hz % H
     qk_scale = sm_scale * 1.44269504
@@ -130,9 +136,10 @@ def _mbwd_kernel(
     K += off_z * stride_kz + off_h * stride_kh
     V += off_z * stride_vz + off_h * stride_vh
     DO += off_z * stride_qz + off_h * stride_qh
-    DQ += off_z * stride_qz + off_h * stride_qh
-    DK += off_z * stride_kz + off_h * stride_kh
-    DV += off_z * stride_vz + off_h * stride_vh
+
+    DQ += off_z * stride_dqz + off_h * stride_dqh
+    DK += off_z * stride_dkz + off_h * stride_dkh
+    DV += off_z * stride_dvz + off_h * stride_dvh
 
     # loop over rows
     offs_k = tl.arange(0, BLOCK_DMODEL)
@@ -164,27 +171,28 @@ def _mbwd_kernel(
     for block_index in range(num_blks):
         start_n = tl.load(blks_ptr + block_index) # load the start (block-level) index of the non-sparse block
         cols = start_n + offs_n # the indices of elements in the non-sparse block of K, V 
+        n_mask = cols[:, None] < context_size
 
         # -- load k, v --
-        k_ptrs  = K + (cols[:, None] * stride_kn + offs_k[None, :] * stride_kk)
+        k_ptrs = K + (cols[:, None] * stride_kn + offs_k[None, :] * stride_kk)
         v_ptrs = V + (cols[:, None] * stride_vn + offs_k[None, :] * stride_vk)
-        k = tl.load(k_ptrs)
-        v = tl.load(v_ptrs)
+        k = tl.load(k_ptrs, mask=n_mask, other=0.)
+        v = tl.load(v_ptrs, mask=n_mask, other=0.)
 
         if CAUSAL:
             causal_mask = (P_SEQ + offs_m[:, None]) >= (cols[None, :])
             qk = tl.where(causal_mask & m_mask, float(0.), float("-inf")).to(tl.float32)
         else:
-            qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
+            qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32) 
 
-        qk += tl.dot(q, tl.trans(k))
-        qk *= qk_scale
+        qk = qk + tl.dot(q, tl.trans(k))
+        qk = qk * qk_scale
         p = tl.math.exp2(qk - l_i[:, None])
 
         # compute dv
-        dv_ptrs = DV + (cols[:, None] * stride_vn + offs_k[None, :] * stride_vk)
+        dv_ptrs = DV + (cols[:, None] * stride_dvn + offs_k[None, :] * stride_dvk)
         dv_vals = tl.dot(tl.trans(p.to(Q.dtype.element_ty)), do)
-        tl.atomic_add(dv_ptrs, dv_vals)
+        tl.atomic_add(dv_ptrs, dv_vals.to(DV.dtype.element_ty), mask=n_mask)
 
         # compute dp = dot(v, do)
         dp = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32) - D_i[:, None]
@@ -194,19 +202,19 @@ def _mbwd_kernel(
         ds = p * dp * sm_scale
 
         # compute dk = dot(ds.T, q)
-        dk_ptrs = DK + (cols[:, None] * stride_kn + offs_k[None, :] * stride_kk)
+        dk_ptrs = DK + (cols[:, None] * stride_dkn + offs_k[None, :] * stride_dkk)
         dk_vals = tl.dot(tl.trans(ds.to(Q.dtype.element_ty)), q)
-        tl.atomic_add(dk_ptrs, dk_vals)
-
+        tl.atomic_add(dk_ptrs, dk_vals.to(DK.dtype.element_ty), mask=n_mask)
         # compute dq
-        dq += tl.dot(ds.to(Q.dtype.element_ty), k)
+        dq = dq + tl.dot(ds.to(Q.dtype.element_ty), k)
 
-    for start_n in range(0, num_cols, BLOCK_N):
+    
+    for start_col_idx in range(0, num_cols, BLOCK_N):
         # the key difference is that cols, as the indices, are stored in and loaded from cols_ptr
         # At each iteration, a block-sized chunk of column **indices** are loaded from cols_ptr, which can be discontinuous
         # But we just load the indices block by block, equivalent to translating the non-sparse columns together
-        n_mask = (start_n + offs_n < num_cols)
-        cols = tl.load(cols_ptr + start_n + offs_n, mask=n_mask, other=0)
+        n_mask = (start_col_idx + offs_n < num_cols)
+        cols = tl.load(cols_ptr + start_col_idx + offs_n, mask=n_mask, other=0.)
 
         # -- load k, v --
         k_ptrs = K + (cols[:, None] * stride_kn + offs_k[None, :] * stride_kk)
@@ -215,15 +223,15 @@ def _mbwd_kernel(
         v = tl.load(v_ptrs, mask=n_mask[:, None], other=0.)
 
         # Computer qk
-        qk = tl.where(m_mask & n_mask, float(0.), float("-inf"))
+        qk = tl.where(m_mask & n_mask[None, :], float(0.), float("-inf"))
         qk = qk + tl.dot(q, tl.trans(k))
         qk = qk * qk_scale
         p = tl.math.exp2(qk - l_i[:, None])
 
         # compute dv
-        dv_ptrs = DV + (cols[:, None] * stride_vn + offs_k[None] * stride_vk)
+        dv_ptrs = DV + (cols[:, None] * stride_dvn + offs_k[None, :] * stride_dvk)
         dv_vals = tl.dot(tl.trans(p.to(Q.dtype.element_ty)), do)
-        tl.atomic_add(dv_ptrs, dv_vals)
+        tl.atomic_add(dv_ptrs, dv_vals, mask=n_mask[:, None])
 
         # compute dp = dot(v, do)
         dp = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32) - D_i[:, None]
@@ -233,17 +241,15 @@ def _mbwd_kernel(
         ds = p * dp * sm_scale
 
         # compute dk = dot(ds.T, q)
-        dk_ptrs = DK + (cols[:, None] * stride_kn + offs_k[None, :] * stride_kk)
+        dk_ptrs = DK + (cols[:, None] * stride_dkn + offs_k[None, :] * stride_dkk)
         dk_vals = tl.dot(tl.trans(ds.to(Q.dtype.element_ty)), q)
-        tl.atomic_add(dk_ptrs, dk_vals)
+        tl.atomic_add(dk_ptrs, dk_vals, mask=n_mask[:, None])
 
         # compute dq
         dq = dq + tl.dot(ds.to(Q.dtype.element_ty), k)
-
-    dq_ptrs = DQ + (offs_m[:, None] * stride_qm + offs_k[None, :] * stride_qk)
-    tl.store(dq_ptrs, dq)
-
-
+    
+    dq_ptrs = DQ + (offs_m[:, None] * stride_dqm + offs_k[None, :] * stride_dqk)
+    tl.store(dq_ptrs, dq.to(DQ.dtype.element_ty), mask=m_mask)
 
 def pad_tensor(x, context_size, head_dim, block_size):
     # Pad to context_length dimension (N_CTX) to be divisible by BLOCK_SIZE_M
@@ -467,12 +473,15 @@ class VSSAttention(torch.autograd.Function):
         query, key, value, 
         block_count, block_offset, column_count, column_index,
         seqlens: torch.Tensor,
+        layer_idx: int, head_idx: int,
         block_size_M: int = 64,
         block_size_N: int = 64,
     ):
         _,  _, context_size, head_dim = query.shape
         ctx.context_size = context_size
         ctx.head_dim = head_dim
+        ctx.layer_idx = layer_idx
+        ctx.head_idx = head_idx
 
         # the input version of Q, K and V are padded to be divisible by BLOCK_SIZE_M
         # the output and softmax_lse are also padded
@@ -507,6 +516,7 @@ class VSSAttention(torch.autograd.Function):
 
         # the original context_size and head_dim
         context_size, head_dim = ctx.context_size, ctx.head_dim
+        layer_idx, head_idx = ctx.layer_idx, ctx.head_idx
         block_size_M, block_size_N = ctx.block_size_M, ctx.block_size_N
         sm_scale = head_dim ** (-0.5)
 
@@ -517,9 +527,9 @@ class VSSAttention(torch.autograd.Function):
         ) = ctx.saved_tensors
         do = pad_tensor(do, context_size, head_dim, block_size_M).contiguous()
         dq, dk, dv = (
-            torch.zeros_like(q).to(torch.float16), 
-            torch.zeros_like(k).to(torch.float16), 
-            torch.zeros_like(v).to(torch.float16)
+            torch.zeros_like(q).to(torch.float32), 
+            torch.zeros_like(k).to(torch.float32), 
+            torch.zeros_like(v).to(torch.float32)
         )
         delta = torch.zeros_like(softmax_lse)
 
@@ -532,33 +542,45 @@ class VSSAttention(torch.autograd.Function):
             D_HEAD=q.shape[-1],
         )
 
-        _mbwd_kernel[(grid[0], grid[1],)](
-            q, k, v,
-            sm_scale,
-            context_size,
-            block_count, block_offset, column_count, column_index,
-            o, do,
-            dq, dk, dv,
-            softmax_lse, delta,
-            q.stride(0), q.stride(1), q.stride(2), q.stride(3),
-            k.stride(0), k.stride(1), k.stride(2), k.stride(3),
-            v.stride(0), v.stride(1), v.stride(2), v.stride(3),
-            q.shape[0], q.shape[1], q.shape[2], 0,
-            grid[0], triton.cdiv(k.shape[2], block_size_N), 
-            block_offset.shape[-1], column_index.shape[-1],
-            BLOCK_M=block_size_M, 
-            BLOCK_N=block_size_N,
-            BLOCK_DMODEL=q.shape[-1], 
-            CAUSAL=True,
-            num_warps=8,
-            num_stages=2,
-        )
+        try:
+            _mbwd_kernel[(grid[0], grid[1],)](
+                q, k, v,
+                sm_scale,
+                context_size,
+                block_count, block_offset, column_count, column_index,
+                o, do,
+                dq, dk, dv,
+                softmax_lse, delta,
+                q.stride(0), q.stride(1), q.stride(2), q.stride(3),
+                k.stride(0), k.stride(1), k.stride(2), k.stride(3),
+                v.stride(0), v.stride(1), v.stride(2), v.stride(3),
+
+                dq.stride(0), dq.stride(1), dq.stride(2), dq.stride(3),
+                dk.stride(0), dk.stride(1), dk.stride(2), dk.stride(3),
+                dv.stride(0), dv.stride(1), dv.stride(2), dv.stride(3),
+
+                q.shape[0], q.shape[1], q.shape[2], 0,
+                grid[0], triton.cdiv(k.shape[2], block_size_N), 
+                block_offset.shape[-1], column_index.shape[-1],
+                BLOCK_M=block_size_M, 
+                BLOCK_N=block_size_N,
+                BLOCK_DMODEL=q.shape[-1], 
+                CAUSAL=True,
+                num_warps=8,
+                num_stages=2,
+            )
+            print('Done')
+        except Exception as e:
+            print(f"Error in (Layer {layer_idx}, Head {head_idx})")
+
+            import traceback
+            traceback.print_exc()
 
         return (
             dq[:, :, :context_size, :head_dim].to(q.dtype), 
             dk[:, :, :context_size, :head_dim].to(k.dtype), 
             dv[:, :, :context_size, :head_dim].to(v.dtype), 
-            None, None, None, None, None
+            None, None, None, None, None, None, None
         )
 
 
@@ -567,6 +589,7 @@ def vs_attn_forward(
     k: torch.Tensor, # [BATCH, N_HEADS, N_CTX, D_HEAD]
     v: torch.Tensor, # [BATCH, N_HEADS, N_CTX, D_HEAD]
     q_len: int, vertical_size: int, slash_size: int, head_dim: int,
+    layer_idx: int, head_idx: int,
     block_size_M: int = 64,
     block_size_N: int = 64,
 ):
@@ -575,7 +598,11 @@ def vs_attn_forward(
         block_size_M, block_size_N,
     )
 
-    return VSSAttention.apply(q, k, v, block_count, block_offset, column_count, column_index, seqlens)
+    return VSSAttention.apply(
+        q, k, v, 
+        block_count, block_offset, column_count, column_index, seqlens,
+        layer_idx, head_idx,
+    )
 
 def test_dense_pattern():
     ATOL, RTOL = 5e-2, 5e-2
@@ -586,10 +613,15 @@ def test_dense_pattern():
 
     vertical_size = 100
     slash_size = context_size
+    # slash_size = 256
 
     q = torch.randn((1, num_heads, context_size, head_dim), dtype=torch.float16, device='cuda', requires_grad=True)
     k = torch.randn((1, num_heads, context_size, head_dim), dtype=torch.float16, device='cuda', requires_grad=True)
     v = torch.randn((1, num_heads, context_size, head_dim), dtype=torch.float16, device='cuda', requires_grad=True)
+
+    # q = torch.ones((1, num_heads, context_size, head_dim), dtype=torch.float16, device='cuda', requires_grad=True)
+    # k = torch.ones((1, num_heads, context_size, head_dim), dtype=torch.float16, device='cuda', requires_grad=True)
+    # v = torch.ones((1, num_heads, context_size, head_dim), dtype=torch.float16, device='cuda', requires_grad=True)
 
     o: torch.Tensor = vs_attn_forward(
         q, k, v, context_size, 

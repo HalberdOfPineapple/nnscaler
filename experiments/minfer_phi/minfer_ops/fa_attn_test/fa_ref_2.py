@@ -26,6 +26,7 @@ def _attn_fwd_inner(acc, l_i, m_i, q,  #
     # loop over k, v and update accumulator
     for start_n in range(lo, hi, BLOCK_N):
         start_n = tl.multiple_of(start_n, BLOCK_N)
+
         # -- compute qk ----
         k = tl.load(K_block_ptr)
         qk = tl.dot(q, k)
@@ -37,13 +38,20 @@ def _attn_fwd_inner(acc, l_i, m_i, q,  #
         else:
             m_ij = tl.maximum(m_i, tl.max(qk, 1) * qk_scale)
             qk = qk * qk_scale - m_ij[:, None]
+
         p = tl.math.exp2(qk)
         l_ij = tl.sum(p, 1)
+
+
         # -- update m_i and l_i
         alpha = tl.math.exp2(m_i - m_ij)
         l_i = l_i * alpha + l_ij
+
+
         # -- update output accumulator --
         acc = acc * alpha[:, None]
+
+
         # update acc
         v = tl.load(V_block_ptr)
         if fp8_v:
@@ -51,10 +59,13 @@ def _attn_fwd_inner(acc, l_i, m_i, q,  #
         else:
             p = p.to(tl.float16)
         acc = tl.dot(p, v, acc)
+
+
         # update m_i and l_i
         m_i = m_ij
         V_block_ptr = tl.advance(V_block_ptr, (BLOCK_N, 0))
         K_block_ptr = tl.advance(K_block_ptr, (0, BLOCK_N))
+
     return acc, l_i, m_i
 
 
