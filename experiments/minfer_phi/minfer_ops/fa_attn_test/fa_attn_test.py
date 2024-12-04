@@ -40,6 +40,8 @@ def gen_block_indices(
     vertical_size, slash_size  = min(q_len, max(vertical_size, 30)), min(q_len, max(slash_size, 50))
     last_q = min(64, q_len)
 
+    torch.cuda.synchronize()
+    print(f"Generating block indices with vertical_size={vertical_size}, slash_size={slash_size}...", end=' ')
     with torch.no_grad():
         qk = torch.einsum(
             f'bhmk, bhnk -> bhmn', 
@@ -71,7 +73,9 @@ def gen_block_indices(
         block_count, block_offset, column_count, column_index = convert_vertical_slash_indexes(
             seqlens, v_idx, s_idx, context_size, block_size_M, block_size_N,
         )
-    
+    print("Done")
+    torch.cuda.synchronize()
+
     return block_count, block_offset, column_count, column_index, seqlens
 
 def attn_by_mode(

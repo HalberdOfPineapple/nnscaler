@@ -616,11 +616,11 @@ class MFMBDT(torch.autograd.Function):
         # the output and softmax_lse are also padded
         sm_scale = head_dim ** -0.5
 
-        # Check column_index
-        if torch.any(column_index < 0) or torch.any(column_index >= context_size):
-            raise ValueError("Ilegal column index detected.")
-        else:
-            print("Column Index is legal.")
+        # # Check column_index
+        # if torch.any(column_index < 0) or torch.any(column_index >= context_size):
+        #     raise ValueError("Ilegal column index detected.")
+        # else:
+        #     print("Column Index is legal.")
 
         query, key, value = (
             pad_tensor(query, context_size, head_dim, block_size_M), 
@@ -666,19 +666,19 @@ class MFMBDT(torch.autograd.Function):
         )
         delta = torch.zeros_like(L)
 
-        torch.cuda.synchronize()
-        print(f"{__class__.__name__} | Starting Preprocess Kernel...", end=" ") 
+        # torch.cuda.synchronize()
+        # print(f"{__class__.__name__} | Starting Preprocess Kernel...", end=" ") 
         _bwd_preprocess[(grid[0] * grid[1], )](
             o, do,
             delta,
             BLOCK_M=block_size_M, 
             D_HEAD=q.shape[-1],
         )
-        print("Done.")
-        torch.cuda.synchronize()
+        # print("Done.")
+        # torch.cuda.synchronize()
 
-        torch.cuda.synchronize()
-        print(f"{__class__.__name__} | Starting Triton Kernel...", end=" ") 
+        # torch.cuda.synchronize()
+        # print(f"{__class__.__name__} | Starting Triton Kernel...", end=" ") 
         _mbwd_dt_kernel[(grid[0], grid[1],)](
             q, k, v,
             sm_scale, context_size,
@@ -704,8 +704,8 @@ class MFMBDT(torch.autograd.Function):
             num_warps=32,
             num_stages=2,
         )
-        print("Done.")
-        torch.cuda.synchronize()
+        # print("Done.")
+        # torch.cuda.synchronize()
 
         return (
             dq[:, :, :context_size, :head_dim].to(q.dtype), 
