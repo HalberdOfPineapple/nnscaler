@@ -74,7 +74,7 @@ def gen_block_indices(
         block_count, block_offset, column_count, column_index = convert_vertical_slash_indexes(
             seqlens, v_idx, s_idx, context_size, block_size_M, block_size_N,
         )
-    
+
     return block_count, block_offset, column_count, column_index, seqlens
 
 @triton.jit
