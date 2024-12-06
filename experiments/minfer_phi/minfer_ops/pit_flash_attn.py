@@ -79,7 +79,7 @@ def gen_block_indices(
         block_count, block_offset, column_count, column_index = convert_vertical_slash_indexes(
             seqlens, v_idx, s_idx, context_size, block_size_M, block_size_N,
         )
-    
+
     return block_count, block_offset, column_count, column_index, seqlens
 
 @triton.jit
@@ -569,7 +569,6 @@ class VSSAttention(torch.autograd.Function):
                 num_warps=8,
                 num_stages=2,
             )
-            print('Done')
         except Exception as e:
             print(f"Error in (Layer {layer_idx}, Head {head_idx})")
 

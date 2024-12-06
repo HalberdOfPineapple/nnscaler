@@ -199,6 +199,7 @@ def attn_fwd_by_heads_v2(
     bsz: int,
     q_len: int,
     head_dim: int,
+    layer_idx: int,
     pattern: Tuple[str, int, int, int],
 ):
     # print(f"head_indices: {head_indices}")
@@ -210,11 +211,12 @@ def attn_fwd_by_heads_v2(
 
         ty, vertical_size, slash_size, _ = pattern
         output = vs_attn_forward(
-            query_states.transpose(1, 2),
-            key_states.transpose(1, 2),
-            value_states.transpose(1, 2),
-            q_len, vertical_size, slash_size, head_dim
-        ).view(bsz, q_len, num_heads, head_dim)
+            query_states,
+            key_states,
+            value_states,
+            q_len, vertical_size, slash_size, head_dim,
+            layer_idx, head_indices
+        ).view(bsz, num_heads, q_len, head_dim)
 
     torch.cuda.synchronize()
     return output
@@ -222,13 +224,13 @@ def attn_fwd_by_heads_v2(
 
 
 # -----------------------------------------------------------
-def test_wo_chunks():
+def test_wo_chunks(attn_ver: int=1):
     from flash_attn import flash_attn_func
     ATOL, RTOL = 5e-2, 5e-2
 
     batch_size = 1
     context_size = 131072
-    num_heads = 1 # 32
+    num_heads = 32
     head_dim = 96
 
     q = torch.randn((batch_size, num_heads, context_size, head_dim), dtype=torch.float16, device='cuda', requires_grad=True)
@@ -236,11 +238,18 @@ def test_wo_chunks():
     v = torch.randn((batch_size, num_heads, context_size, head_dim), dtype=torch.float16, device='cuda', requires_grad=True)
     head_indices = torch.arange(num_heads, device='cuda', dtype=torch.int32)
 
-    o = attn_fwd_by_heads(
-        q, k, v, head_indices,
-        batch_size, context_size, head_dim, 
-        ("vertical_and_slash", 100, context_size, 1)
-    ) # [batch_size, context_size, num_heads, head_dim]
+    if attn_ver == 1:
+        o = attn_fwd_by_heads(
+            q, k, v, head_indices,
+            batch_size, context_size, head_dim, 0,
+            ("vertical_and_slash", 100, context_size, 1)
+        ) # [batch_size, context_size, num_heads, head_dim]
+    else:
+        o = attn_fwd_by_heads_v2(
+            q, k, v, head_indices,
+            batch_size, context_size, head_dim, 0,
+            ("vertical_and_slash", 100, context_size, 1)
+        )
     print(f"o.shape: {o.shape}")
 
     q.retain_grad()
@@ -554,12 +563,92 @@ def test_w_chunks():
             print(f"V Grad:\n{v_grad[0, head_idx, :, :]}")
             print(f"V Grad Ref:\n{v_ref_grad[0, head_idx, :, :]}")
 
-if __name__ == "__main__":
-    # print('-' * 80)
-    # print(f"Test without chunks...")
-    # test_wo_chunks()
 
+def run_w_chunks():
+    batch_size = 1
+    context_size = 131072
+    num_heads = 32
+    head_dim = 96
+
+    q = torch.randn((batch_size, num_heads, context_size, head_dim), dtype=torch.float16, device='cuda', requires_grad=True)
+    k = torch.randn((batch_size, num_heads, context_size, head_dim), dtype=torch.float16, device='cuda', requires_grad=True)
+    v = torch.randn((batch_size, num_heads, context_size, head_dim), dtype=torch.float16, device='cuda', requires_grad=True)
+    head_indices = torch.arange(num_heads, device='cuda', dtype=torch.int32)
+    chunk_size = 4
+
+    q_chunks = q.chunk(chunk_size, dim=1)
+    k_chunks = k.chunk(chunk_size, dim=1)
+    v_chunks = v.chunk(chunk_size, dim=1)
+    head_indices_chunks = head_indices.chunk(chunk_size)
+
+    o_chunks = []
+    for q_chunk, k_chunk, v_chunk, head_indice_chunk in zip(q_chunks, k_chunks, v_chunks, head_indices_chunks):
+        o_chunk = attn_fwd_by_heads(
+            q_chunk, k_chunk, v_chunk, head_indice_chunk,
+            batch_size, context_size, head_dim, 
+            layer_idx=0,
+            pattern=("vertical_and_slash", 100, context_size, 1),
+        )
+        o_chunks.append(o_chunk)
+    o = torch.cat(o_chunks, dim=1)
+
+    loss = torch.square(o).sum(dtype=torch.float64)
+    loss.backward()
+
+def run_w_chunks_fa():
+    from flash_attn import flash_attn_func
+
+    batch_size = 1
+    context_size = 131072
+    num_heads = 32
+    head_dim = 96
+
+    q = torch.randn((batch_size, num_heads, context_size, head_dim), dtype=torch.float16, device='cuda', requires_grad=True)
+    k = torch.randn((batch_size, num_heads, context_size, head_dim), dtype=torch.float16, device='cuda', requires_grad=True)
+    v = torch.randn((batch_size, num_heads, context_size, head_dim), dtype=torch.float16, device='cuda', requires_grad=True)
+    head_indices = torch.arange(num_heads, device='cuda', dtype=torch.int32)
+    chunk_size = 4
+
+    q_chunks = q.chunk(chunk_size, dim=1)
+    k_chunks = k.chunk(chunk_size, dim=1)
+    v_chunks = v.chunk(chunk_size, dim=1)
+    head_indices_chunks = head_indices.chunk(chunk_size)
+
+    o_chunks = []
+    for q_chunk, k_chunk, v_chunk, head_indice_chunk in zip(q_chunks, k_chunks, v_chunks, head_indices_chunks):
+        o_chunk = flash_attn_func(
+            q_chunk.transpose(1, 2),
+            k_chunk.transpose(1, 2),
+            v_chunk.transpose(1, 2),
+            dropout_p=0.0,
+            softmax_scale=None,
+            causal=True,
+        )
+        o_chunks.append(o_chunk)
+    o = torch.cat(o_chunks, dim=1)
+
+    loss = torch.square(o).sum(dtype=torch.float64)
+    loss.backward()
+
+
+if __name__ == "__main__":
+    import sys
+    mode: str = sys.argv[1]
 
     print('-' * 80)
-    print(f"Test with chunks...")
-    test_w_chunks()
+    if mode.startswith('test_wo_chunks'):
+        if mode.split('_')[-1].startswith('v'):
+            mode, ver = mode.split('_')[:-1], int(mode.split('_')[-1][-1])
+        else:
+            ver = 1
+        print(f"Test without chunks (ver={ver})...")
+        test_wo_chunks(ver)
+    elif mode == 'test_w_chunks':
+        print(f"Test with chunks...")
+        test_w_chunks()
+    elif mode == 'run_w_chunks':
+        print(f"Run with chunks...")
+        run_w_chunks()
+    elif mode == 'run_w_chunks_fa':
+        print(f"Run with chunks (FA)...")
+        run_w_chunks_fa()
