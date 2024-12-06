@@ -5,11 +5,6 @@ import numpy as np
 import triton
 import triton.language as tl
 
-from minference.cuda import convert_vertical_slash_indexes
-from minference.modules.minference_forward import (
-    LAST_Q_MASK, sum_all_diagonal_matrix
-)
-
 from nnscaler.graph.parser.register import register_op
 from flash_attn.flash_attn_interface import _flash_attn_backward
 
@@ -542,39 +537,32 @@ class VSSAttention(torch.autograd.Function):
             D_HEAD=q.shape[-1],
         )
 
-        try:
-            _mbwd_kernel[(grid[0], grid[1],)](
-                q, k, v,
-                sm_scale,
-                context_size,
-                block_count, block_offset, column_count, column_index,
-                o, do,
-                dq, dk, dv,
-                softmax_lse, delta,
-                q.stride(0), q.stride(1), q.stride(2), q.stride(3),
-                k.stride(0), k.stride(1), k.stride(2), k.stride(3),
-                v.stride(0), v.stride(1), v.stride(2), v.stride(3),
+        _mbwd_kernel[(grid[0], grid[1],)](
+            q, k, v,
+            sm_scale,
+            context_size,
+            block_count, block_offset, column_count, column_index,
+            o, do,
+            dq, dk, dv,
+            softmax_lse, delta,
+            q.stride(0), q.stride(1), q.stride(2), q.stride(3),
+            k.stride(0), k.stride(1), k.stride(2), k.stride(3),
+            v.stride(0), v.stride(1), v.stride(2), v.stride(3),
 
-                dq.stride(0), dq.stride(1), dq.stride(2), dq.stride(3),
-                dk.stride(0), dk.stride(1), dk.stride(2), dk.stride(3),
-                dv.stride(0), dv.stride(1), dv.stride(2), dv.stride(3),
+            dq.stride(0), dq.stride(1), dq.stride(2), dq.stride(3),
+            dk.stride(0), dk.stride(1), dk.stride(2), dk.stride(3),
+            dv.stride(0), dv.stride(1), dv.stride(2), dv.stride(3),
 
-                q.shape[0], q.shape[1], q.shape[2], 0,
-                grid[0], triton.cdiv(k.shape[2], block_size_N), 
-                block_offset.shape[-1], column_index.shape[-1],
-                BLOCK_M=block_size_M, 
-                BLOCK_N=block_size_N,
-                BLOCK_DMODEL=q.shape[-1], 
-                CAUSAL=True,
-                num_warps=8,
-                num_stages=2,
-            )
-            print('Done')
-        except Exception as e:
-            print(f"Error in (Layer {layer_idx}, Head {head_idx})")
-
-            import traceback
-            traceback.print_exc()
+            q.shape[0], q.shape[1], q.shape[2], 0,
+            grid[0], triton.cdiv(k.shape[2], block_size_N), 
+            block_offset.shape[-1], column_index.shape[-1],
+            BLOCK_M=block_size_M, 
+            BLOCK_N=block_size_N,
+            BLOCK_DMODEL=q.shape[-1], 
+            CAUSAL=True,
+            num_warps=8,
+            num_stages=2,
+        )
 
         return (
             dq[:, :, :context_size, :head_dim].to(q.dtype), 
