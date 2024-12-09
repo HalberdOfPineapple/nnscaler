@@ -417,6 +417,7 @@ def print_args(args: argparse.Namespace):
     print(f"Save Attention Data Every {args.attn_save_step} Steps")
 
     print('-' * 40)
+    print(f"Model Config Path:\t{args.model_config_path}")
     print(f'MInferenece Config Path:\t{args.minfer_config_path}')
     print(f"Compile Save Path:\t{args.compile_save_path}")
     print(f"Attention Save Path:\t{args.attn_save_path}")
