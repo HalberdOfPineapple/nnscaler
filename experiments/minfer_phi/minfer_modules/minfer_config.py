@@ -11,6 +11,9 @@ EXPR_MODEL2PATH = {
 
 class ExprMInferConfig(MInferenceConfig):
     def update_config_path(self, config_path: str, model_name: str):
+        if config_path is not None:
+            return config_path
+
         if model_name in EXPR_MODEL2PATH:
             return EXPR_MODEL2PATH[model_name]
 
@@ -41,4 +44,5 @@ class ExprMInference(MInference):
             attn_kwargs=attn_kwargs,
             **kwargs,
         )
+        print(f"Using MInference config from: {self.config.config_path}")
 

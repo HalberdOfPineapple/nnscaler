@@ -224,12 +224,18 @@ def main(args):
         print(f"{__name__} | (Expr 3) Using MInference-equipped Model ...")
         minfer_phi_init()
 
-    minfer_config_path = os.path.join(MINFER_CONFIG_DIR, f'{args.name}.yaml')
+    minfer_config_path = os.path.join(MINFER_CONFIG_DIR, f'{args.minfer_config_name}.yaml')
     if not os.path.exists(minfer_config_path):
+        print(f"{__name__} | MInfernece config {args.minfer_config_name} not found in {minfer_config_path}. Use empty minfer config")
         minfer_config = {}
     else:
+        print(f"{__name__} | MInfernece config {args.minfer_config_name} found in {minfer_config_path}")
         with open(minfer_config_path, 'r') as f:
             minfer_config = yaml.safe_load(f)
+        print('-' * 20)
+        print("MInference Config:")
+        print(minfer_config)
+        print('-' * 20)
 
     if args.run_mode == 'run':
         broadcast_strategy = 'all'
@@ -238,7 +244,6 @@ def main(args):
 
     set_default_logger_level('INFO')
     
-
     ## Setup Dataset ##
     dataset = load_from_disk(args.dataset_path)
     tokenizer = get_tokenizer(args.model_id)
@@ -417,7 +422,7 @@ def print_args(args: argparse.Namespace):
     print(f"Save Attention Data Every {args.attn_save_step} Steps")
 
     print('-' * 40)
-    print(f'MInferenece Config Path:\t{args.minfer_config_path}')
+    print(f'MInferenece Config Name:\t{args.minfer_config_name}')
     print(f"Compile Save Path:\t{args.compile_save_path}")
     print(f"Attention Save Path:\t{args.attn_save_path}")
     print(f"Tensorboard Log Path:\t{args.tf_log_dir}")
@@ -449,7 +454,7 @@ if __name__ == '__main__':
     parser.add_argument('--model_config_path', type=str, default=None, help='path to the model config')
     parser.add_argument('-s', '--attn_save_step', type=int, default=1, help='Save attention data every n steps')
 
-    parser.add_argument('--minfer_config_path', type=str, default=None, help='path to minference config')
+    parser.add_argument('--minfer_config_name', type=str, default=None, help='Name of Minference config file')
     parser.add_argument('--compile_save_path', type=str, default='./.nnscaler', help='path to save compiled code')
     parser.add_argument('--attn_save_path', type=str, default=None, help='path to save attention data')
     parser.add_argument('--tf_log_dir', type=str, default=None, help='path to save tensorboard logs')
