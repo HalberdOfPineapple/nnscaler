@@ -32,5 +32,5 @@ if __name__ == '__main__':
         raise ValueError('output_fname is required')
 
     set_default_logger_level('INFO')
-    ckpt_files = [os.path.join(args.ckpt_dir, f) for f in os.listdir(args.ckpt_dir) if f.endswith('.ckpt')]
+    ckpt_files = [os.path.join(args.ckpt_dir, f) for f in os.listdir(args.ckpt_dir) if f.endswith('.ckpt') and not f.startswith('merged')]
     Trainer.merge_checkpoint(ckpt_files, args.output_fname)
