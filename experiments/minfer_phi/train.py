@@ -480,6 +480,8 @@ if __name__ == '__main__':
     if args.n_iter <= 0: args.n_iter = None
     if args.n_epochs <= 0: args.n_epochs = None
 
+    if args.minfer_config_name.lower() == 'none': args.minfer_config_name = None
+
     args.selected_layers = eval(args.selected_layers)
     main(args)
 
