@@ -1,4 +1,5 @@
 import os
+import time
 import math
 import yaml
 import torch
@@ -68,6 +69,10 @@ TOPK = 1024
 NUM_GLOBAL_BATCHES = 2
 GLOBAL_BATCH_SIZE = 64
 MICRO_BATCH_SIZE = 1
+
+# NUM_GLOBAL_BATCHES = 1
+# GLOBAL_BATCH_SIZE = 1
+# MICRO_BATCH_SIZE = 1
 
 NUM_LAYERS = 32
 NUM_HEADS = 32
@@ -306,7 +311,7 @@ class BaselineAttentionWSparse(NNScalerPhiFlashAttention2):
 
 
         # ---------------------------------------
-        print('-' * 30)
+        # print('-' * 30)
         causal_mask = torch.arange(q_len - LAST_Q, q_len, device=DEVICE_2)[:, None] >= torch.arange(q_len, device=DEVICE_2)[None, :]
         # print(f"Layer {self.layer_idx} | gpu memory {torch.cuda.memory_allocated(DEVICE_2) / 1024**3:.2f} GB after causal mask")
 
@@ -332,7 +337,7 @@ class BaselineAttentionWSparse(NNScalerPhiFlashAttention2):
         del qk, topk_values, attn_weights
 
         torch.cuda.synchronize()    
-        print(f"Layer {self.layer_idx} | gpu memory {torch.cuda.memory_allocated(DEVICE_2) / 1024**3:.2f} GB attention outputting at layer {self.layer_idx}")
+        # print(f"Layer {self.layer_idx} | gpu memory {torch.cuda.memory_allocated(DEVICE_2) / 1024**3:.2f} GB attention outputting at layer {self.layer_idx}")
         return res
 
 class MInferAttentionWSparse(MInferAttention):
@@ -395,7 +400,7 @@ class MInferAttentionWSparse(MInferAttention):
 
 
         # ---------------------------------------
-        print('-' * 30)
+        # print('-' * 30)
         causal_mask = torch.arange(q_len - LAST_Q, q_len, device=DEVICE_2)[:, None] >= torch.arange(q_len, device=DEVICE_2)[None, :]
         # print(f"Layer {self.layer_idx} | gpu memory {torch.cuda.memory_allocated(DEVICE_2) / 1024 ** 3:.2f} GB after causal mask")
 
@@ -421,7 +426,7 @@ class MInferAttentionWSparse(MInferAttention):
         del qk, topk_values, attn_weights
 
         torch.cuda.synchronize()    
-        print(f"Layer {self.layer_idx} | gpu memory {torch.cuda.memory_allocated(DEVICE_2) / 1024**3:.2f} GB attention outputting at layer {self.layer_idx}")
+        # print(f"Layer {self.layer_idx} | gpu memory {torch.cuda.memory_allocated(DEVICE_2) / 1024**3:.2f} GB attention outputting at layer {self.layer_idx}")
         return res
 
 class BaselineSparseModel(BaselineModel):
@@ -473,6 +478,13 @@ if __name__ == '__main__':
 
     torch.cuda.empty_cache()
 
+    # ------------------------------------------------------------------
+    if args.debug:
+        GLOBAL_BATCH_SIZE = 1
+
+    
+    # ------------------------------------------------------------------
+    # Setting for Pretrained checkpoint
     if not args.original:
         model_id = f"/scratch/eval/{args.gpu_set}/minfer_phi/{args.expr_name}/checkpoints/{args.epoch_idx:04d}-{args.iter_idx:04d}/merged"
     else:
@@ -481,7 +493,55 @@ if __name__ == '__main__':
         args.epoch_idx = 0
         args.iter_idx = 0
 
+
+    # ------------------------------------------------------------------
+    # Print Settings
+    print('-' * 60)
+    print(f"Experiment: {args.expr_name}")
+    print(f"GPU Set: {args.gpu_set}")
+    print(f"Epoch: {args.epoch_idx}")
+    print(f"Iteration: {args.iter_idx}")
+    print(f"Use Pretrained Checkpoint: {args.original}")
+    print(f"Debug: {args.debug}")
+    print('-' * 30)
+    print(f"Number of Global Batches: {NUM_GLOBAL_BATCHES}")
+    print(f"Global Batch Size: {GLOBAL_BATCH_SIZE}")
+    print(f"Micro Batch Size: {MICRO_BATCH_SIZE}")
+    print(f"Last Q: {LAST_Q}")
+    print(f"TopK: {TOPK}")
+    print('-' * 60)
+
+    # ------------------------------------------------------------------
+    # Set log file
+    import sys
+    log_file_path = os.path.join(
+        f'/blob/nnscaler_store/{args.gpu_set}', args.expr_dir, args.expr_name,
+        'checkpoints', f'{args.epoch_idx:04d}-{args.iter_idx:04d}', 'sparse_ratio.log'
+    )
+    os.makedirs(os.path.dirname(log_file_path), exist_ok=True)
+    print(f"Logging to {log_file_path}")
+    sys.stdout = open(log_file_path, 'w')
+    sys.stderr = sys.stdout
+    print('-' * 60)
+    print(f"Experiment: {args.expr_name}")
+    print(f"GPU Set: {args.gpu_set}")
+    print(f"Epoch: {args.epoch_idx}")
+    print(f"Iteration: {args.iter_idx}")
+    print(f"Use Pretrained Checkpoint: {args.original}")
+    print(f"Debug: {args.debug}")
+    print('-' * 30)
+    print(f"Number of Global Batches: {NUM_GLOBAL_BATCHES}")
+    print(f"Global Batch Size: {GLOBAL_BATCH_SIZE}")
+    print(f"Micro Batch Size: {MICRO_BATCH_SIZE}")
+    print(f"Last Q: {LAST_Q}")
+    print(f"TopK: {TOPK}")
+    print('-' * 60)
+
+
+    # ------------------------------------------------------------------
+    # Replace the Attention module 
     if 'mfmb' not in args.expr_name:
+        print(f"Using Baseline model for {args.expr_name}...")
         PHI_ATTENTION_CLASSES['flash_attention_2'] = BaselineAttentionWSparse
         if not args.original:
             model = BaselineSparseModel(model_id=model_id)
@@ -491,11 +551,13 @@ if __name__ == '__main__':
                 config_path=f"{os.getenv('NNSCALER_HOME')}/experiments/minfer_phi/phi3/lc_config"
             )
     else:
+        print(f"Using MInfer model for {args.expr_name}...")
         PHI_ATTENTION_CLASSES['flash_attention_2'] = MInferAttentionWSparse
         model = MInferSparseModel(model_id=model_id)
 
-    data_iter = get_dataloader(model_id)
     
+    # ------------------------------------------------------------------#
+    # Set save path
     sparse_ratio_save_url = (
         f"https://chengzhang.blob.core.windows.net/wenxuanli/nnscaler_store/"
         f"{args.gpu_set}/{args.expr_dir}/{args.expr_name}/checkpoints/"
@@ -507,10 +569,17 @@ if __name__ == '__main__':
     )
     os.makedirs(sprase_ratio_save_local_dir, exist_ok=True)
 
+
+    # ------------------------------------------------------------------
+    # Get dataloader
+    data_iter = get_dataloader(model_id)
+
+    # ------------------------------------------------------------------
+    # Iterate over the batches within a global batch
     for idx, batches in data_iter:
         if idx >= NUM_GLOBAL_BATCHES: break
         print('-' * 60)
-        print(f"Batch {idx}: {len(batches)}")
+        print(f"Global batch {idx} with {len(batches)} micro batches")
         save_url_idx = sparse_ratio_save_url + f"{str(idx)}.npy"
         save_url_loss_idx = sparse_ratio_save_url + f"{str(idx)}_loss.npy"
         save_local_idx = os.path.join(sprase_ratio_save_local_dir, f"{str(idx)}.npy")
@@ -523,15 +592,18 @@ if __name__ == '__main__':
         losses = np.zeros((GLOBAL_BATCH_SIZE, ))
         with torch.no_grad():
             for i, batch in enumerate(batches):
+                print("-" * 30)
+                start_time = time.perf_counter()
                 outputs = model(batch)
+                infer_time = time.perf_counter() - start_time
+
                 loss, _, _, _ = outputs
 
                 micro_sparse_ratios = model.get_sparse_ratio() # [1, LAYER, HEAD, LAST_Q]
-                # print(sparse_ratios.size())
 
                 sparse_ratios[i] = micro_sparse_ratios.squeeze(0).cpu().numpy()
                 losses[i] = loss.cpu().numpy()
-                print(f"Batch {idx} | Sample {i} | Loss: {losses[i]}")
+                print(f"Batch {idx} | Sample {i} | Loss: {losses[i]} | Time: {infer_time:.3f} s")
 
         print(f'Saving sparse ratio for batch {idx}...', end=' ')
         np.save(save_local_idx, sparse_ratios)
