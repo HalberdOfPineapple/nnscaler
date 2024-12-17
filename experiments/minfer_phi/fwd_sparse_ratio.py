@@ -3,6 +3,7 @@ import time
 import math
 import yaml
 import torch
+import datetime
 import datasets
 import argparse
 import builtins
@@ -70,8 +71,8 @@ NUM_GLOBAL_BATCHES = 2
 GLOBAL_BATCH_SIZE = 64
 MICRO_BATCH_SIZE = 1
 
-# NUM_GLOBAL_BATCHES = 1
-# GLOBAL_BATCH_SIZE = 1
+# NUM_GLOBAL_BATCHES = 2
+# GLOBAL_BATCH_SIZE = 5
 # MICRO_BATCH_SIZE = 1
 
 NUM_LAYERS = 32
@@ -82,6 +83,21 @@ def run_cmd(cmd):
 
     if result.returncode != 0:
         print(f"Error running command {cmd}. Exiting...")
+        return 1
+    return 0
+
+def transfer_by_cp(local_path, dir='upload'):
+    if dir == 'upload':
+        run_res = run_cmd([
+            'cp', local_path, local_path.replace('/scratch/eval', '/blob/nnscaler_store')
+        ])
+    else:
+        run_res = run_cmd([
+            'cp', local_path.replace('/scratch/eval', '/blob/nnscaler_store'), local_path
+        ])
+    
+    if run_res != 0:
+        print(f"Error {'uploading' if dir == 'upload' else 'downloading'} {local_path}. Exiting...")
         return 1
     return 0
 
@@ -478,9 +494,9 @@ if __name__ == '__main__':
 
     torch.cuda.empty_cache()
 
-    # ------------------------------------------------------------------
-    if args.debug:
-        GLOBAL_BATCH_SIZE = 1
+    # # ------------------------------------------------------------------
+    # if args.debug:
+    #     GLOBAL_BATCH_SIZE = 1
 
     
     # ------------------------------------------------------------------
@@ -522,6 +538,7 @@ if __name__ == '__main__':
     print(f"Logging to {log_file_path}")
     sys.stdout = open(log_file_path, 'w')
     sys.stderr = sys.stdout
+    print(f"Current time: {datetime.datetime.now()}")
     print('-' * 60)
     print(f"Experiment: {args.expr_name}")
     print(f"GPU Set: {args.gpu_set}")
@@ -540,7 +557,7 @@ if __name__ == '__main__':
 
     # ------------------------------------------------------------------
     # Replace the Attention module 
-    if 'mfmb' not in args.expr_name:
+    if 'mfmb' not in args.expr_name and 'mf_mb' not in args.expr_name:
         print(f"Using Baseline model for {args.expr_name}...")
         PHI_ATTENTION_CLASSES['flash_attention_2'] = BaselineAttentionWSparse
         if not args.original:
@@ -553,7 +570,13 @@ if __name__ == '__main__':
     else:
         print(f"Using MInfer model for {args.expr_name}...")
         PHI_ATTENTION_CLASSES['flash_attention_2'] = MInferAttentionWSparse
-        model = MInferSparseModel(model_id=model_id)
+        model = MInferSparseModel(
+            model_id=model_id,
+            minfer_config={
+                # MInfer's config is the one searched from the pretrained (4k) version with LongRoPE
+                'config_path': "/scratch/nnscaler/experiments/minfer_phi/minfer_modules/configs/Phi-3-mini-4k-instruct-LongRoPE-128k.json"
+            }
+        )
 
     
     # ------------------------------------------------------------------#
@@ -572,10 +595,13 @@ if __name__ == '__main__':
 
     # ------------------------------------------------------------------
     # Get dataloader
+    print("Getting dataloader...", end=" ")
     data_iter = get_dataloader(model_id)
+    print("Done.")
 
     # ------------------------------------------------------------------
     # Iterate over the batches within a global batch
+    sys.stdout.flush()
     for idx, batches in data_iter:
         if idx >= NUM_GLOBAL_BATCHES: break
         print('-' * 60)
@@ -604,8 +630,10 @@ if __name__ == '__main__':
                 sparse_ratios[i] = micro_sparse_ratios.squeeze(0).cpu().numpy()
                 losses[i] = loss.cpu().numpy()
                 print(f"Batch {idx} | Sample {i} | Loss: {losses[i]} | Time: {infer_time:.3f} s")
+                sys.stdout.flush()
 
         print(f'Saving sparse ratio for batch {idx}...', end=' ')
+        
         np.save(save_local_idx, sparse_ratios)
         print('Done.')
 
@@ -614,27 +642,13 @@ if __name__ == '__main__':
         print('Done.')
 
         print(f'Uploading sparse ratio for batch {idx}...', end=' ')
-        run_res = run_cmd(
-            [
-                "azcopy",
-                "copy",
-                save_local_idx,
-                save_url_idx + SAS_POSTFIX,
-            ],
-        )
+        run_res = transfer_by_cp(save_local_idx)
         if run_res != 0:
             print(f"Error uploading sparse ratio for batch {idx}. Exiting...")
         print('Done.')
 
         print(f'Uploading loss for batch {idx}...', end=' ')
-        run_res = run_cmd(
-            [
-                "azcopy",
-                "copy",
-                save_local_loss_idx,
-                save_url_loss_idx + SAS_POSTFIX,
-            ],
-        )
+        run_res = transfer_by_cp(save_local_loss_idx)
         if run_res != 0:
             print(f"Error uploading loss for batch {idx}. Exiting...")
         print('Done.')
