@@ -481,7 +481,7 @@ if __name__ == '__main__':
         args.epoch_idx = 0
         args.iter_idx = 0
 
-    if 'mfmb' not in model_id:
+    if 'mfmb' not in args.expr_name:
         PHI_ATTENTION_CLASSES['flash_attention_2'] = BaselineAttentionWSparse
         if not args.original:
             model = BaselineSparseModel(model_id=model_id)
@@ -531,6 +531,7 @@ if __name__ == '__main__':
 
                 sparse_ratios[i] = micro_sparse_ratios.squeeze(0).cpu().numpy()
                 losses[i] = loss.cpu().numpy()
+                print(f"Batch {idx} | Sample {i} | Loss: {losses[i]}")
 
         print(f'Saving sparse ratio for batch {idx}...', end=' ')
         np.save(save_local_idx, sparse_ratios)
