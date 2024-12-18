@@ -490,6 +490,7 @@ if __name__ == '__main__':
     parser.add_argument("--original", action="store_true")
     parser.add_argument('-d', '--debug', action='store_true')
     parser.add_argument("-o", "--override", action="store_true")
+    parser.add_argument("--model_id", type=str, default=None)
     args = parser.parse_args()
 
     torch.cuda.empty_cache()
@@ -505,7 +506,7 @@ if __name__ == '__main__':
         model_id = f"/scratch/eval/{args.gpu_set}/minfer_phi/{args.expr_name}/checkpoints/{args.epoch_idx:04d}-{args.iter_idx:04d}/merged"
     else:
         print("Using the pretrained(original) model checkpoint...")
-        model_id = "microsoft/Phi-3-mini-4k-instruct"
+        model_id = "microsoft/Phi-3-mini-4k-instruct" if args.model_id is None else args.model_id
         args.epoch_idx = 0
         args.iter_idx = 0
 
@@ -541,6 +542,7 @@ if __name__ == '__main__':
     print(f"Current time: {datetime.datetime.now()}")
     print('-' * 60)
     print(f"Experiment: {args.expr_name}")
+    print(f"Model ID: {model_id}")
     print(f"GPU Set: {args.gpu_set}")
     print(f"Epoch: {args.epoch_idx}")
     print(f"Iteration: {args.iter_idx}")
@@ -659,6 +661,6 @@ if __name__ == '__main__':
         print("Cleaning up...", end=' ')
         run_cmd(["rm", "-rf", os.path.join(
             '/scratch/eval', args.gpu_set, args.expr_dir, args.expr_name, "checkpoints",
-            f"{args.epoch_idx:04d}-{args.iter_idx:04d}",
+            f"{args.epoch_idx:04d}-{args.iter_idx:04d}", "pytorch_model.bin"
         )])
         print("Done.")
