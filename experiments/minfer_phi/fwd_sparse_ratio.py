@@ -318,42 +318,35 @@ class BaselineAttentionWSparse(NNScalerPhiFlashAttention2):
         # Because the input can be padded, the absolute sequence length depends on the max position id.
         rotary_seq_len = max(kv_seq_len, position_ids[:, -1].max().item()) + 1
         cos, sin = self.rotary_emb(value_states, position_ids, seq_len=rotary_seq_len)
-
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
 
         # repeat k/v heads if n_kv_heads < n_heads
         key_states = repeat_kv(key_states, self.num_key_value_groups)
         value_states = repeat_kv(value_states, self.num_key_value_groups)
 
-
         # ---------------------------------------
         # print('-' * 30)
         causal_mask = torch.arange(q_len - LAST_Q, q_len, device=DEVICE_2)[:, None] >= torch.arange(q_len, device=DEVICE_2)[None, :]
-        # print(f"Layer {self.layer_idx} | gpu memory {torch.cuda.memory_allocated(DEVICE_2) / 1024**3:.2f} GB after causal mask")
-
-
+        
+        print('-' * 60)
+        print(f"Before QK^T: query_states:\n{query_states}\nkey_states:\n{key_states}\n")  
         qk = torch.einsum(
             f'bhmk, bhnk -> bhmn', 
             query_states[:, :, -LAST_Q:, :].contiguous().to(DEVICE_2), # [BATCH, N_HEADS, LAST_Q, D_HEAD]
             key_states.to(DEVICE_2), # [BATCH, N_HEADS, N_CTX, D_HEAD]
         ) / math.sqrt(self.head_dim) # [BATCH, N_HEADS, LAST_Q, N_CTX]
-        # print(f"Layer {self.layer_idx} | gpu memory {torch.cuda.memory_allocated(DEVICE_2) / 1024**3:.2f} GB after calculating QK")
 
         qk = torch.where(causal_mask, qk, float('-inf'))
         del causal_mask
 
 
         attn_weights = torch.nn.functional.softmax(qk, dim=-1)
-        # print(f"Layer {self.layer_idx} | gpu memory {torch.cuda.memory_allocated(DEVICE_2) / 1024**3:.2f} GB after softmax")
 
         # Calculate the sum of topk elements at each row of the attention weights
         topk_values, _ = torch.topk(attn_weights, TOPK, dim=-1)
         self.sparse_ratio = torch.sum(topk_values, dim=-1).cpu() # [BATCH, N_HEAD, LAST_Q]
-        # print(f"Layer {self.layer_idx} | sparse_ratio shape: {self.sparse_ratio.size()}")
         del qk, topk_values, attn_weights
-
-        torch.cuda.synchronize()    
-        # print(f"Layer {self.layer_idx} | gpu memory {torch.cuda.memory_allocated(DEVICE_2) / 1024**3:.2f} GB attention outputting at layer {self.layer_idx}")
+        
         return res
 
 class MInferAttentionWSparse(MInferAttention):
@@ -376,7 +369,6 @@ class MInferAttentionWSparse(MInferAttention):
             use_cache=use_cache,
             **kwargs,
         )
-
 
         output_attentions = False
         bsz, q_len, _ = hidden_states.size()
@@ -407,42 +399,34 @@ class MInferAttentionWSparse(MInferAttention):
         # Because the input can be padded, the absolute sequence length depends on the max position id.
         rotary_seq_len = max(kv_seq_len, position_ids[:, -1].max().item()) + 1
         cos, sin = self.rotary_emb(value_states, position_ids, seq_len=rotary_seq_len)
-
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
 
         # repeat k/v heads if n_kv_heads < n_heads
         key_states = repeat_kv(key_states, self.num_key_value_groups)
         value_states = repeat_kv(value_states, self.num_key_value_groups)
 
-
         # ---------------------------------------
         # print('-' * 30)
         causal_mask = torch.arange(q_len - LAST_Q, q_len, device=DEVICE_2)[:, None] >= torch.arange(q_len, device=DEVICE_2)[None, :]
-        # print(f"Layer {self.layer_idx} | gpu memory {torch.cuda.memory_allocated(DEVICE_2) / 1024 ** 3:.2f} GB after causal mask")
-
-
+        
+        print('-' * 60)
+        print(f"Before QK^T: query_states:\n{query_states}\nkey_states:\n{key_states}\n")  
         qk = torch.einsum(
             f'bhmk, bhnk -> bhmn', 
             query_states[:, :, -LAST_Q:, :].contiguous().to(DEVICE_2), # [BATCH, N_HEADS, LAST_Q, D_HEAD]
             key_states.to(DEVICE_2), # [BATCH, N_HEADS, N_CTX, D_HEAD]
         ) / math.sqrt(self.head_dim) # [BATCH, N_HEADS, LAST_Q, N_CTX]
-        # print(f"Layer {self.layer_idx} | gpu memory {torch.cuda.memory_allocated(DEVICE_2) / 1024 ** 3:.2f} GB after calculating QK")
-
         qk = torch.where(causal_mask, qk, float('-inf'))
         del causal_mask
 
 
         attn_weights = torch.nn.functional.softmax(qk, dim=-1)
-        # print(f"Layer {self.layer_idx} | gpu memory {torch.cuda.memory_allocated(DEVICE_2) / 1024 ** 3:.2f} GB after softmax")
 
         # Calculate the sum of topk elements at each row of the attention weights
         topk_values, _ = torch.topk(attn_weights, TOPK, dim=-1)
         self.sparse_ratio = torch.sum(topk_values, dim=-1).cpu() # [BATCH, N_HEAD, LAST_Q]
-        # print(f"Layer {self.layer_idx} | sparse_ratio shape: {self.sparse_ratio.size()}")
         del qk, topk_values, attn_weights
 
-        torch.cuda.synchronize()    
-        # print(f"Layer {self.layer_idx} | gpu memory {torch.cuda.memory_allocated(DEVICE_2) / 1024**3:.2f} GB attention outputting at layer {self.layer_idx}")
         return res
 
 class BaselineSparseModel(BaselineModel):
@@ -495,11 +479,6 @@ if __name__ == '__main__':
 
     torch.cuda.empty_cache()
 
-    # # ------------------------------------------------------------------
-    # if args.debug:
-    #     GLOBAL_BATCH_SIZE = 1
-
-    
     # ------------------------------------------------------------------
     # Setting for Pretrained checkpoint
     if not args.original:
@@ -536,9 +515,17 @@ if __name__ == '__main__':
         'checkpoints', f'{args.epoch_idx:04d}-{args.iter_idx:04d}', 'sparse_ratio.log'
     )
     os.makedirs(os.path.dirname(log_file_path), exist_ok=True)
+    try:
+        log_f = open(log_file_path, 'w')
+    except Exception as e:
+        print(f"Error opening log file {log_file_path}.")
+        log_file_path = log_file_path.replace('/blob/nnscaler_store', '/scratch/eval')
+        log_f = open(log_file_path, 'w')
+
     print(f"Logging to {log_file_path}")
-    sys.stdout = open(log_file_path, 'w')
+    sys.stdout = log_f
     sys.stderr = sys.stdout
+
     print(f"Current time: {datetime.datetime.now()}")
     print('-' * 60)
     print(f"Experiment: {args.expr_name}")
@@ -562,23 +549,26 @@ if __name__ == '__main__':
     if 'mfmb' not in args.expr_name and 'mf_mb' not in args.expr_name:
         print(f"Using Baseline model for {args.expr_name}...")
         PHI_ATTENTION_CLASSES['flash_attention_2'] = BaselineAttentionWSparse
-        if not args.original:
-            model = BaselineSparseModel(model_id=model_id)
-        else:
-            model = BaselineSparseModel(
-                model_id=model_id,
-                config_path=f"{os.getenv('NNSCALER_HOME')}/experiments/minfer_phi/phi3/lc_config"
-            )
+        model_args = {
+            "model_id": model_id,
+        }
+        if args.original:
+            model_args['config_path'] = f"{os.getenv('NNSCALER_HOME')}/experiments/minfer_phi/phi3/lc_config"
+        model = BaselineSparseModel(**model_args)
     else:
         print(f"Using MInfer model for {args.expr_name}...")
         PHI_ATTENTION_CLASSES['flash_attention_2'] = MInferAttentionWSparse
-        model = MInferSparseModel(
-            model_id=model_id,
-            minfer_config={
+
+        model_args = {
+            "model_id": model_id,
+            "minfer_config": {
                 # MInfer's config is the one searched from the pretrained (4k) version with LongRoPE
-                'config_path': "/scratch/nnscaler/experiments/minfer_phi/minfer_modules/configs/Phi-3-mini-4k-instruct-LongRoPE-128k.json"
-            }
-        )
+                'config_path': "/scratch/nnscaler/experiments/minfer_phi/minfer_modules/configs/Phi-3-mini-4k-instruct-LongRoPE-128k.json",
+            },
+        }
+        if args.original:
+            model_args['config_path'] = f"{os.getenv('NNSCALER_HOME')}/experiments/minfer_phi/phi3/lc_config"
+        model = MInferSparseModel(**model_args)
 
     
     # ------------------------------------------------------------------#
@@ -656,6 +646,13 @@ if __name__ == '__main__':
         print('Done.')
 
         if args.debug: break
+    
+    if not log_file_path.startswith('/blob/nnscaler_store'):
+        log_f.close()
+        print(f"Copying log file to blob storage...", end=' ')
+        run_res = transfer_by_cp(log_file_path)
+        if run_res != 0:
+            print(f"Error uploading log file. Exiting...")
 
     if not args.debug:
         print("Cleaning up...", end=' ')
