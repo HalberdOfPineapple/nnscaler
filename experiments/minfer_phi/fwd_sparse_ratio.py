@@ -87,13 +87,15 @@ def run_cmd(cmd):
     return 0
 
 def transfer_by_cp(local_path, dir='upload'):
+    remote_path = local_path.replace('/scratch/eval', '/blob/nnscaler_store')
+    os.makedirs(os.path.dirname(remote_path), exist_ok=True)
     if dir == 'upload':
         run_res = run_cmd([
-            'cp', local_path, local_path.replace('/scratch/eval', '/blob/nnscaler_store')
+            'cp', local_path, remote_path
         ])
     else:
         run_res = run_cmd([
-            'cp', local_path.replace('/scratch/eval', '/blob/nnscaler_store'), local_path
+            'cp', remote_path, local_path
         ])
     
     if run_res != 0:
@@ -328,8 +330,9 @@ class BaselineAttentionWSparse(NNScalerPhiFlashAttention2):
         # print('-' * 30)
         causal_mask = torch.arange(q_len - LAST_Q, q_len, device=DEVICE_2)[:, None] >= torch.arange(q_len, device=DEVICE_2)[None, :]
         
-        print('-' * 60)
-        print(f"Before QK^T: query_states:\n{query_states}\nkey_states:\n{key_states}\n")  
+        # if self.layer_idx == 0:
+        #     print('-' * 60)
+        #     print(f"Before QK^T: query_states:\n{query_states}\nkey_states:\n{key_states}\n")
         qk = torch.einsum(
             f'bhmk, bhnk -> bhmn', 
             query_states[:, :, -LAST_Q:, :].contiguous().to(DEVICE_2), # [BATCH, N_HEADS, LAST_Q, D_HEAD]
@@ -409,8 +412,9 @@ class MInferAttentionWSparse(MInferAttention):
         # print('-' * 30)
         causal_mask = torch.arange(q_len - LAST_Q, q_len, device=DEVICE_2)[:, None] >= torch.arange(q_len, device=DEVICE_2)[None, :]
         
-        print('-' * 60)
-        print(f"Before QK^T: query_states:\n{query_states}\nkey_states:\n{key_states}\n")  
+        # if self.layer_idx == 0:
+        #     print('-' * 60)
+        #     print(f"Before QK^T: query_states:\n{query_states}\nkey_states:\n{key_states}\n")
         qk = torch.einsum(
             f'bhmk, bhnk -> bhmn', 
             query_states[:, :, -LAST_Q:, :].contiguous().to(DEVICE_2), # [BATCH, N_HEADS, LAST_Q, D_HEAD]
@@ -569,7 +573,9 @@ if __name__ == '__main__':
         if args.original:
             model_args['config_path'] = f"{os.getenv('NNSCALER_HOME')}/experiments/minfer_phi/phi3/lc_config"
         model = MInferSparseModel(**model_args)
-
+    print('-' * 60)
+    print(f"Model Config:")
+    print(model.model.config)
     
     # ------------------------------------------------------------------#
     # Set save path
@@ -578,11 +584,11 @@ if __name__ == '__main__':
         f"{args.gpu_set}/{args.expr_dir}/{args.expr_name}/checkpoints/"
         f"{args.epoch_idx:04d}-{args.iter_idx:04d}/sparse_ratios/"
     )
-    sprase_ratio_save_local_dir = os.path.join(
+    sparse_ratio_save_local_dir = os.path.join(
         '/scratch/eval', args.gpu_set, args.expr_dir, args.expr_name, "checkpoints",
         f"{args.epoch_idx:04d}-{args.iter_idx:04d}", "sparse_ratios"
     )
-    os.makedirs(sprase_ratio_save_local_dir, exist_ok=True)
+    os.makedirs(sparse_ratio_save_local_dir, exist_ok=True)
 
 
     # ------------------------------------------------------------------
@@ -600,10 +606,13 @@ if __name__ == '__main__':
         print(f"Global batch {idx} with {len(batches)} micro batches")
         save_url_idx = sparse_ratio_save_url + f"{str(idx)}.npy"
         save_url_loss_idx = sparse_ratio_save_url + f"{str(idx)}_loss.npy"
-        save_local_idx = os.path.join(sprase_ratio_save_local_dir, f"{str(idx)}.npy")
-        save_local_loss_idx = os.path.join(sprase_ratio_save_local_dir, f"{str(idx)}_loss.npy")
-        if os.path.exists(save_local_idx) and not args.override:
+        save_local_idx = os.path.join(sparse_ratio_save_local_dir, f"{str(idx)}.npy")
+        save_local_loss_idx = os.path.join(sparse_ratio_save_local_dir, f"{str(idx)}_loss.npy")
+        if (os.path.exists(save_local_idx) 
+            or os.path.exists(save_local_idx.replace('/scratch/eval', '/blob/nnscaler_store'))) \
+            and not args.override:
             print(f"Skipping batch {idx} because {save_local_idx} exists (use '--override' to override).")
+            sys.stdout.flush()
             continue
 
         sparse_ratios = np.zeros((GLOBAL_BATCH_SIZE, NUM_LAYERS, NUM_HEADS, LAST_Q))
@@ -658,6 +667,6 @@ if __name__ == '__main__':
         print("Cleaning up...", end=' ')
         run_cmd(["rm", "-rf", os.path.join(
             '/scratch/eval', args.gpu_set, args.expr_dir, args.expr_name, "checkpoints",
-            f"{args.epoch_idx:04d}-{args.iter_idx:04d}", "pytorch_model.bin"
+            f"{args.epoch_idx:04d}-{args.iter_idx:04d}", "merged",
         )])
         print("Done.")
