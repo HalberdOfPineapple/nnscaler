@@ -21,6 +21,7 @@ from transformers.utils import (
 from nnscaler.cli.trainer_args import (
     DatasetConfig,
     TrainerArgs,
+    ComputeConfig,
     DataloaderConfig,
     DatasetSamplerConfig,
     load_type
@@ -244,7 +245,6 @@ def cal_last_QK(
     past_key_value: Optional[Cache],
     return_qkv: bool = False,
 ):
-    output_attentions = False
     bsz, q_len, _ = hidden_states.size()
 
     qkv = self.qkv_proj(hidden_states)
@@ -303,7 +303,6 @@ def cal_last_QK(
 
 
 def build_sparse_mask(
-    head_idx:int,
     block_count: torch.Tensor, # [BATCH, N_HEADS, NUM_ROWS], note that NUM_ROWS means the number of 64-sized rows
     block_offset, # [BATCH, N_HEADS, NUM_ROWS, NNZ_S], which refers to the start of the non-sparse K/V blocks to be computed with the corresponding Q block
     column_count, # [BATCH, N_HEADS, NUM_ROWS]
@@ -311,28 +310,36 @@ def build_sparse_mask(
     block_size_M: int = 64,
     block_size_N: int = 64,
 ):
-    attn_mask = torch.zeros((MICRO_BATCH_SIZE, 1, LAST_Q, SEQ_LEN), device=DEVICE_1)
+    attn_mask = torch.zeros((MICRO_BATCH_SIZE, LAST_Q, SEQ_LEN), device=DEVICE_2)
     row_offset = (SEQ_LEN - LAST_Q) // block_size_M
     num_row_blocks = LAST_Q // block_size_M
 
     for batch_idx in range(MICRO_BATCH_SIZE):
         for row_idx in range(row_offset, row_offset + num_row_blocks):
-            block_cnt = block_count[batch_idx, head_idx, row_idx]
-            block_off = block_offset[batch_idx, head_idx, row_idx]
-            col_cnt = column_count[batch_idx, head_idx, row_idx]
-            col_idx = column_index[batch_idx, head_idx, row_idx]
+            block_cnt = block_count[batch_idx, 0, row_idx]
+            block_off = block_offset[batch_idx, 0, row_idx]
+            col_cnt = column_count[batch_idx, 0, row_idx]
+            col_idx = column_index[batch_idx, 0, row_idx]
 
-            row_start = row_idx * block_size_M
-            row_end = min(SEQ_LEN, row_start + block_size_M)
+            row_start = row_idx * block_size_M - (SEQ_LEN - LAST_Q)
+            row_end = min(LAST_Q, row_start + block_size_M)
+            print(f"Row-Dimension Start: {row_start} End: {row_end}")
 
             for i in range(block_cnt):
                 curr_block_start = block_off[i]
                 curr_block_end = min(SEQ_LEN, curr_block_start + block_size_N)
-                attn_mask[batch_idx, head_idx, row_start:row_end, curr_block_start:curr_block_end] = 1
-            
+                print(f"Column-Dimension Start: {curr_block_start} End: {curr_block_end}")
+
+                # attn_mask[batch_idx, row_start:row_end, curr_block_start:curr_block_end] = 1
+                attn_mask[batch_idx, row_start:row_end, curr_block_start:curr_block_end] = \
+                    torch.ones((row_end - row_start, curr_block_end - curr_block_start), device=DEVICE_2)
+
             for j in range(col_cnt):
-                col_idx = col_idx[j]
-                attn_mask[batch_idx, head_idx, row_start:row_end, col_idx] = 1
+                col_index = col_idx[j]
+                # attn_mask[batch_idx, row_start:row_end, col_index] = 1
+                attn_mask[batch_idx, row_start:row_end, col_index] = \
+                    torch.ones((row_end - row_start), device=DEVICE_2)
+
     return attn_mask
 
 def get_sparse_ratio(
@@ -407,27 +414,46 @@ class BaselineAttentionWSparse(NNScalerPhiFlashAttention2):
             self.attn_blocks = save_attn_blocks(attn_weights, k_bsz=K_BLOCK_SIZE) # [BATCH, N_HEADS, N_BLOCKS, LAST_Q, K_BLOCK_SIZE]
             # print(f"BaselineAttentionWSparse attn_blocks shape: {self.attn_blocks.shape}")
         
-        
         if self.peek_attn_recall:
-            
             attn_mask = []
             for head_idx in range(NUM_HEADS):
-                print(f"Peeking Attention Recall for Layer {self.layer_idx}, Head {head_idx}...")
+                print(f"Peeking Attention Recall for Layer {self.layer_idx}, Head {head_idx}...", flush=True)
                 pattern = self.best_pattern.get(head_idx, ("vertical_and_slash", 100, 6096, 1))
                 ty, vertical_size, slash_size, _ = pattern
+                print(f"Layer {self.layer_idx} Head {head_idx} Pattern: {pattern}", flush=True)
 
                 block_count, block_offset, column_count, column_index, _ = gen_block_indices(
-                    query_states[:, head_idx], key_states[:, head_idx], value_states[:, head_idx],
+                    query_states[:, head_idx].unsqueeze(1) , 
+                    key_states[:, head_idx].unsqueeze(1) ,
+                    value_states[:, head_idx].unsqueeze(1) ,
                     SEQ_LEN, vertical_size, slash_size, self.head_dim,
                     block_size_M=64, block_size_N=64
                 )
 
                 head_mask = build_sparse_mask(block_count, block_offset, column_count, column_index)
+                print(f"Layer {self.layer_idx} Head {head_idx} head_mask: {head_mask}", flush=True)
+                print(f"Layer {self.layer_idx} Head {head_idx} is all zero: {torch.all(head_mask == 0)}", flush=True)
+
                 attn_mask.append(head_mask)
-            attn_mask = torch.concat(attn_mask, dim=1) # [BATCH, N_HEADS, LAST_Q, SEQ_LEN]
+            attn_mask = torch.stack(attn_mask, dim=1) # [BATCH, N_HEADS, LAST_Q, SEQ_LEN]
+            # convert attn_mask to bool
+            attn_mask = attn_mask.bool()
+            print(f"Layer {self.layer_idx} attn_mask: {attn_mask}", flush=True)
+
             causal_mask = torch.arange(SEQ_LEN - LAST_Q, SEQ_LEN, device=DEVICE_2)[:, None] >= torch.arange(SEQ_LEN, device=DEVICE_2)[None, :]
-            sparse_attn_weights = torch.where(attn_mask & causal_mask[None, None, :, :], attn_weights, float('-inf'))
-            self.attn_recalls = torch.sum(sparse_attn_weights, dim=-1) # [BATCH, N_HEADS, LAST_Q]
+
+            qk = torch.einsum(
+                f'bhmk, bhnk -> bhmn', 
+                query_states[:, :, -LAST_Q:, :].contiguous().to(DEVICE_2), # [BATCH, N_HEADS, LAST_Q, D_HEAD]
+                key_states.to(DEVICE_2), # [BATCH, N_HEADS, N_CTX, D_HEAD]
+            ) / math.sqrt(self.head_dim) # [BATCH, N_HEADS, LAST_Q, N_CTX]
+
+            print(f"Layer {self.layer_idx} QK: {qk} before masking", flush=True)
+            qk = torch.where(attn_mask & causal_mask[None, None, :, :], qk, float('-inf'))
+            print(f"Layer {self.layer_idx} QK: {qk} after masking", flush=True)
+            
+            sparse_attn_weights = torch.nn.functional.softmax(qk, dim=-1)
+            self.attn_recalls = torch.sum(sparse_attn_weights, dim=-1).cpu().numpy() # [BATCH, N_HEADS, LAST_Q]
 
         return res
     
@@ -529,11 +555,15 @@ class BaselineSparseModel(BaselineModel):
     
     def get_attn_recalls(self):
         attn_recalls = []
-        for layer in self.model.model.layers:
-            attn_recall = layer.self_attn.attn_recalls # [BATCH, N_HEADS, LAST_Q]
-            attn_recalls.append(attn_recall)
+        for i, layer in enumerate(self.model.model.layers):
+            try:
+                attn_recall = layer.self_attn.attn_recalls # [BATCH, N_HEADS, LAST_Q]
+                attn_recalls.append(attn_recall)
+            except AttributeError:
+                print(f"[Warning] Layer {i} does not have attn_recalls attribute. Skipping...")
+                continue
 
-        attn_recalls = torch.stack(attn_recalls, dim=1) # [BATCH, NUM_LAYERS, N_HEADS, LAST_Q]
+        attn_recalls = np.stack(attn_recalls, axis=1) # [BATCH, NUM_LAYERS, N_HEADS, LAST_Q]
         return attn_recalls
 
 class MInferSparseModel(MInferModel):
@@ -735,6 +765,7 @@ def iter_for_attn_recall(args):
                 if num_samples >= NUM_ATTN_SAMPLES: break
                 if args.debug: break
         if num_samples >= NUM_ATTN_SAMPLES: break
+        if args.debug: break
 
 def print_args(args):
     print('-' * 60)
@@ -795,10 +826,17 @@ if __name__ == '__main__':
     # ------------------------------------------------------------------
     # Set log file
     import sys
+    if args.peek_attn:
+        log_file_name = 'attn_peek.log'
+    elif args.peek_attn_recall:
+        log_file_name = 'attn_recall_peek.log'
+    else:
+        log_file_name = 'sparse_ratio.log'
+
     log_file_path = os.path.join(
         f'/scratch/sync/nnscaler_store/{args.gpu_set}', args.expr_dir, args.expr_name,
         'checkpoints', f'{args.epoch_idx:04d}-{args.iter_idx:04d}', 
-        'sparse_ratio.log' if not args.peek_attn else 'attn_peek.log'
+        log_file_name
     )
     os.makedirs(os.path.dirname(log_file_path), exist_ok=True)
     try:
@@ -877,6 +915,8 @@ if __name__ == '__main__':
     # Start Iteration
     if args.peek_attn:
         iter_for_attn_peek(args)
+    elif args.peek_attn_recall:
+        iter_for_attn_recall(args)
     else:
         iter_for_sparse_ratio(args)
     
