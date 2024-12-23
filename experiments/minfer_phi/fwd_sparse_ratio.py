@@ -323,12 +323,12 @@ def build_sparse_mask(
 
             row_start = row_idx * block_size_M - (SEQ_LEN - LAST_Q)
             row_end = min(LAST_Q, row_start + block_size_M)
-            print(f"Row-Dimension Start: {row_start} End: {row_end}")
+            # print(f"Row-Dimension Start: {row_start} End: {row_end}")
 
             for i in range(block_cnt):
                 curr_block_start = block_off[i]
                 curr_block_end = min(SEQ_LEN, curr_block_start + block_size_N)
-                print(f"Column-Dimension Start: {curr_block_start} End: {curr_block_end}")
+                # print(f"Column-Dimension Start: {curr_block_start} End: {curr_block_end}")
 
                 # attn_mask[batch_idx, row_start:row_end, curr_block_start:curr_block_end] = 1
                 attn_mask[batch_idx, row_start:row_end, curr_block_start:curr_block_end] = \
@@ -417,11 +417,8 @@ class BaselineAttentionWSparse(NNScalerPhiFlashAttention2):
         if self.peek_attn_recall:
             attn_mask = []
             for head_idx in range(NUM_HEADS):
-                print(f"Peeking Attention Recall for Layer {self.layer_idx}, Head {head_idx}...", flush=True)
                 pattern = self.best_pattern.get(head_idx, ("vertical_and_slash", 100, 6096, 1))
                 ty, vertical_size, slash_size, _ = pattern
-                print(f"Layer {self.layer_idx} Head {head_idx} Pattern: {pattern}", flush=True)
-
                 block_count, block_offset, column_count, column_index, _ = gen_block_indices(
                     query_states[:, head_idx].unsqueeze(1) , 
                     key_states[:, head_idx].unsqueeze(1) ,
@@ -431,14 +428,11 @@ class BaselineAttentionWSparse(NNScalerPhiFlashAttention2):
                 )
 
                 head_mask = build_sparse_mask(block_count, block_offset, column_count, column_index)
-                print(f"Layer {self.layer_idx} Head {head_idx} head_mask: {head_mask}", flush=True)
-                print(f"Layer {self.layer_idx} Head {head_idx} is all zero: {torch.all(head_mask == 0)}", flush=True)
-
+                
                 attn_mask.append(head_mask)
             attn_mask = torch.stack(attn_mask, dim=1) # [BATCH, N_HEADS, LAST_Q, SEQ_LEN]
             # convert attn_mask to bool
             attn_mask = attn_mask.bool()
-            print(f"Layer {self.layer_idx} attn_mask: {attn_mask}", flush=True)
 
             causal_mask = torch.arange(SEQ_LEN - LAST_Q, SEQ_LEN, device=DEVICE_2)[:, None] >= torch.arange(SEQ_LEN, device=DEVICE_2)[None, :]
 
@@ -447,10 +441,7 @@ class BaselineAttentionWSparse(NNScalerPhiFlashAttention2):
                 query_states[:, :, -LAST_Q:, :].contiguous().to(DEVICE_2), # [BATCH, N_HEADS, LAST_Q, D_HEAD]
                 key_states.to(DEVICE_2), # [BATCH, N_HEADS, N_CTX, D_HEAD]
             ) / math.sqrt(self.head_dim) # [BATCH, N_HEADS, LAST_Q, N_CTX]
-
-            print(f"Layer {self.layer_idx} QK: {qk} before masking", flush=True)
             qk = torch.where(attn_mask & causal_mask[None, None, :, :], qk, float('-inf'))
-            print(f"Layer {self.layer_idx} QK: {qk} after masking", flush=True)
             
             sparse_attn_weights = torch.nn.functional.softmax(qk, dim=-1)
             self.attn_recalls = torch.sum(sparse_attn_weights, dim=-1).cpu().numpy() # [BATCH, N_HEADS, LAST_Q]
