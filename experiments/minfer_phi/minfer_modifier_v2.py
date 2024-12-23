@@ -152,8 +152,8 @@ def attn_fwd_by_heads(
             pattern = pattern_dict.get(head_indices[head].item(), ("vertical_and_slash", 100, 6096, 1))
             ty, vertical_size, slash_size, _ = pattern
 
-            print('-' * 30)
-            print(f"Layer {layer_idx} | Head {head_indices[head].item()} | Pattern {pattern}")
+            # print('-' * 30)
+            # print(f"Layer {layer_idx} | Head {head_indices[head].item()} | Pattern {pattern}")
 
             try:
                 attn_output_head = vs_attn_forward(

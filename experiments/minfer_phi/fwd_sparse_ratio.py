@@ -569,8 +569,7 @@ def iter_for_sparse_ratio(args):
 
 def iter_for_attn_peek(args):
     print('-' * 60)
-    print(f"Running Peek Attention Mode")
-    sys.stdout.flush()
+    print(f"Running Peek Attention Mode", flush=True)
     global NUM_ATTN_BLOCKS, NUM_ATTN_SAMPLES
     if args.num_peek_blocks != NUM_ATTN_BLOCKS:
         NUM_ATTN_BLOCKS = args.num_peek_blocks
@@ -583,20 +582,15 @@ def iter_for_attn_peek(args):
         args.gpu_set, args.expr_dir, args.expr_name, "checkpoints",
         f"{args.epoch_idx:04d}-{args.iter_idx:04d}", "attn_blocks"
     )
+    local_attn_save_dir = attn_block_save_dir.replace('/scratch/sync', '/scratch/eval')
     os.makedirs(attn_block_save_dir, exist_ok=True)
+    os.makedirs(local_attn_save_dir, exist_ok=True)
 
     num_samples = 0
     for idx, batches in data_iter:
         attn_blocks = np.zeros((NUM_LAYERS, NUM_HEADS, NUM_ATTN_BLOCKS, LAST_Q, K_BLOCK_SIZE))
         with torch.no_grad():
             for i, batch in enumerate(batches):
-                attn_block_save_path = os.path.join(attn_block_save_dir, f"{str(num_samples)}.npy")
-                if os.path.exists(attn_block_save_path) and not args.override:
-                    print(f"Skipping sample {num_samples} because {attn_block_save_path} exists (use '--override' to override).")
-                    sys.stdout.flush()
-                    continue
-                
-
                 print("-" * 30)
                 start_time = time.perf_counter()
                 outputs = model(batch)
@@ -605,11 +599,23 @@ def iter_for_attn_peek(args):
                 loss, _, _, _ = outputs
 
                 attn_blocks = model.get_attn_blocks()[0] # [NUM_LAYERS, N_HEADS, N_BLOCKS, LAST_Q, K_BLOCK_SIZE]
-                print(f"Batch {idx} | Sample {i} | Loss: {loss.cpu().numpy()} | Time: {infer_time:.3f} s")
-                sys.stdout.flush()
+                print(f"Batch {idx} | Sample {i} | Loss: {loss.cpu().numpy()} | Time: {infer_time:.3f} s", flush=True)
 
-                print(f'Saving sparse ratio for batch {idx}...', end=' ')
-                np.save(attn_block_save_path, attn_blocks)
+                print(f'Saving sparse ratio for batch {idx}...')
+                for l in range(NUM_LAYERS):
+                    for h in range(NUM_HEADS):
+                        for block_idx in range(NUM_ATTN_BLOCKS):
+                            print(f"Saving attn block for layer {l}, head {h}, block {block_idx}...", end=' ', flush=True)
+                            attn_block_save_path = os.path.join(
+                                # local_attn_save_dir,
+                                attn_block_save_dir.replace("/scratch/sync", "/scratch/eval"),
+                                f"sample_{num_samples}",
+                                f"layer_{l}", f"head_{h}", f"block_{block_idx}.npy"
+                            )
+                            os.makedirs(os.path.dirname(attn_block_save_path), exist_ok=True)
+                            np.save(attn_block_save_path, attn_blocks[l][h][block_idx])
+                            print('Done.', flush=True)
+
                 print('Done.')
                 sys.stdout.flush()
 
