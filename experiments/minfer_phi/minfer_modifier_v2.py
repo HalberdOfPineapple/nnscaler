@@ -116,10 +116,10 @@ class MInferAttention(PhiAttention):
         # print(f"query_states: {query_states.shape}, key_states: {key_states.shape}, value_states: {value_states.shape}, head_indices: {head_indices.shape}")
         attn_output = attn_fwd_by_heads(
             query_states, key_states, value_states, head_indices,
-            bsz, q_len,  self.head_dim, self.layer_idx, 
+            bsz, q_len, self.head_dim, self.layer_idx, 
             self.best_pattern,
         ) # expect:  b l^ {q_anno} vd^'
-    
+
         attn_output = attn_output.reshape(bsz, q_len, self.hidden_size).contiguous()
         attn_output = self.o_proj(attn_output)
 

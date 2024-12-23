@@ -1,21 +1,16 @@
 import os
+import json
 import time
 import math
-import yaml
 import torch
-import datetime
-import datasets
 import argparse
-import builtins
-import importlib
 import subprocess
 import numpy as np
-import huggingface_hub
 
 from datasets import load_from_disk
 from torch.utils.data import DataLoader
 from typing import List, Optional, Tuple, Union, Any, Dict
-from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer, DataCollatorForLanguageModeling
+from transformers import DataCollatorForLanguageModeling
 from transformers.cache_utils import Cache
 from transformers.models.llama.modeling_llama import LlamaRMSNorm as RMSNorm
 from transformers.utils import (
@@ -23,28 +18,13 @@ from transformers.utils import (
     
 )
 
-from flash_attn import flash_attn_func, flash_attn_varlen_func
-
-
-from nnscaler.utils import set_default_logger_level
 from nnscaler.cli.trainer_args import (
-    CheckpointConfig,
     DatasetConfig,
-    HookMapConfig,
-    ModelConfig,
-    OptimizerConfig,
     TrainerArgs,
     DataloaderConfig,
-    AggregatedOutputs,
-    LogConfig,
     DatasetSamplerConfig,
     load_type
 )
-from nnscaler.parallel import ComputeConfig, BroadcastGenFilesStrategy
-from nnscaler.runtime.f16_optimizer import MixedPrecisionAdamW
-from nnscaler.cli.loggers.tensorboard import TensorBoardLogger
-
-from custom_trainer import get_iter_cnt, need_save_data
 from phi3 import (
     Phi3Config as PhiConfig, Phi3Attention as PhiAttention, 
     PHI3_ATTENTION_CLASSES as PHI_ATTENTION_CLASSES, 
@@ -53,7 +33,7 @@ from phi3 import (
 from modeling_modifier import NNScalerPhiFlashAttention2
 from minfer_modifier_v2 import MInferAttention
 from train import get_tokenizer, BaselineModel, MInferModel
-
+from minfer_ops import gen_block_indices
 
 with open("/scratch/sync/.secrets/sas_token", "r") as f:
     SAS_TOKEN = f.read().strip()
@@ -262,6 +242,7 @@ def cal_last_QK(
     hidden_states: torch.Tensor,
     position_ids: Optional[torch.LongTensor],
     past_key_value: Optional[Cache],
+    return_qkv: bool = False,
 ):
     output_attentions = False
     bsz, q_len, _ = hidden_states.size()
@@ -315,8 +296,44 @@ def cal_last_QK(
 
 
     attn_weights = torch.nn.functional.softmax(qk, dim=-1)
-    return attn_weights
+    if return_qkv:
+        return attn_weights, query_states, key_states, value_states
+    else:
+        return attn_weights, None, None, None
 
+
+def build_sparse_mask(
+    head_idx:int,
+    block_count: torch.Tensor, # [BATCH, N_HEADS, NUM_ROWS], note that NUM_ROWS means the number of 64-sized rows
+    block_offset, # [BATCH, N_HEADS, NUM_ROWS, NNZ_S], which refers to the start of the non-sparse K/V blocks to be computed with the corresponding Q block
+    column_count, # [BATCH, N_HEADS, NUM_ROWS]
+    column_index, # [BATCH, N_HEADS, NUM_ROWS, NNZ_V]
+    block_size_M: int = 64,
+    block_size_N: int = 64,
+):
+    attn_mask = torch.zeros((MICRO_BATCH_SIZE, 1, LAST_Q, SEQ_LEN), device=DEVICE_1)
+    row_offset = (SEQ_LEN - LAST_Q) // block_size_M
+    num_row_blocks = LAST_Q // block_size_M
+
+    for batch_idx in range(MICRO_BATCH_SIZE):
+        for row_idx in range(row_offset, row_offset + num_row_blocks):
+            block_cnt = block_count[batch_idx, head_idx, row_idx]
+            block_off = block_offset[batch_idx, head_idx, row_idx]
+            col_cnt = column_count[batch_idx, head_idx, row_idx]
+            col_idx = column_index[batch_idx, head_idx, row_idx]
+
+            row_start = row_idx * block_size_M
+            row_end = min(SEQ_LEN, row_start + block_size_M)
+
+            for i in range(block_cnt):
+                curr_block_start = block_off[i]
+                curr_block_end = min(SEQ_LEN, curr_block_start + block_size_N)
+                attn_mask[batch_idx, head_idx, row_start:row_end, curr_block_start:curr_block_end] = 1
+            
+            for j in range(col_cnt):
+                col_idx = col_idx[j]
+                attn_mask[batch_idx, head_idx, row_start:row_end, col_idx] = 1
+    return attn_mask
 
 def get_sparse_ratio(
     attn_weights: torch.Tensor,
@@ -332,7 +349,7 @@ def save_attn_blocks(
 ):
     # attn_weights - [BATCH, N_HEADS, LAST_Q, SEQ_LEN]
     attn_blocks = []
-    starting_indices = list(range(0, SEQ_LEN - K_BLOCK_SIZE, (SEQ_LEN - K_BLOCK_SIZE) // NUM_ATTN_BLOCKS))
+    starting_indices = list(range(0, SEQ_LEN - K_BLOCK_SIZE, (SEQ_LEN - K_BLOCK_SIZE) // (NUM_ATTN_BLOCKS - 1) ))[:-1]
     starting_indices.append(SEQ_LEN - K_BLOCK_SIZE)
     for i in starting_indices:
         attn_block = attn_weights[..., i:i+k_bsz].cpu().numpy() # [BATCH, N_HEADS, LAST_Q, K_BLOCK_SIZE]
@@ -379,15 +396,46 @@ class BaselineAttentionWSparse(NNScalerPhiFlashAttention2):
             **kwargs,
         )
 
-        attn_weights = self.cal_last_QK(hidden_states, position_ids, past_key_value)
+        attn_weights, query_states, key_states, value_states = \
+                self.cal_last_QK(
+                    hidden_states, position_ids, past_key_value, 
+                    return_qkv=self.peek_attn_recall,
+                )
         self.sparse_ratio = get_sparse_ratio(attn_weights)
         
         if self.save_attn:
             self.attn_blocks = save_attn_blocks(attn_weights, k_bsz=K_BLOCK_SIZE) # [BATCH, N_HEADS, N_BLOCKS, LAST_Q, K_BLOCK_SIZE]
             # print(f"BaselineAttentionWSparse attn_blocks shape: {self.attn_blocks.shape}")
+        
+        
+        if self.peek_attn_recall:
+            
+            attn_mask = []
+            for head_idx in range(NUM_HEADS):
+                print(f"Peeking Attention Recall for Layer {self.layer_idx}, Head {head_idx}...")
+                pattern = self.best_pattern.get(head_idx, ("vertical_and_slash", 100, 6096, 1))
+                ty, vertical_size, slash_size, _ = pattern
+
+                block_count, block_offset, column_count, column_index, _ = gen_block_indices(
+                    query_states[:, head_idx], key_states[:, head_idx], value_states[:, head_idx],
+                    SEQ_LEN, vertical_size, slash_size, self.head_dim,
+                    block_size_M=64, block_size_N=64
+                )
+
+                head_mask = build_sparse_mask(block_count, block_offset, column_count, column_index)
+                attn_mask.append(head_mask)
+            attn_mask = torch.concat(attn_mask, dim=1) # [BATCH, N_HEADS, LAST_Q, SEQ_LEN]
+            causal_mask = torch.arange(SEQ_LEN - LAST_Q, SEQ_LEN, device=DEVICE_2)[:, None] >= torch.arange(SEQ_LEN, device=DEVICE_2)[None, :]
+            sparse_attn_weights = torch.where(attn_mask & causal_mask[None, None, :, :], attn_weights, float('-inf'))
+            self.attn_recalls = torch.sum(sparse_attn_weights, dim=-1) # [BATCH, N_HEADS, LAST_Q]
 
         return res
+    
+    def init_attn_recall(self, minfer_config_path: str):
+        self.best_pattern = {int(ii): jj for ii, jj in json.load(open(minfer_config_path))[self.layer_idx].items()}
+        print(f"[BaselineAttentionWSparse] MInfer config for {len(self.best_pattern)} heads in Layer {self.layer_idx} initialized")
 
+        
 class MInferAttentionWSparse(MInferAttention):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -429,16 +477,19 @@ class MInferAttentionWSparse(MInferAttention):
             # print(f"MInferAttentionWSparse attn_blocks shape: {self.attn_blocks.shape}")
         
         return res
-    
-    # def cal_attn_recall(self, last_attn_weights: torch.Tensor):
-    #     # last_attn_weights - [BATCH, N_HEADS, LAST_Q, SEQ_LEN]
-    #     _, num_heads, _, _ = last_attn_weights.size()
-    #     for i in range(num_heads):
-        
 
 class BaselineSparseModel(BaselineModel):
-    def __init__(self, save_attn: bool=False, **kwargs):
+    def __init__(
+            self, 
+            save_attn: bool=False, 
+            peek_attn_recall: bool=False,
+            minfer_config_path: str = None,
+            **kwargs
+        ):
         super().__init__(**kwargs)
+
+        if peek_attn_recall and minfer_config_path is None:
+            raise ValueError("minfer_config_path is required for attention recall peeking.")
         
         self.model = self.model.to(DEVICE_1)
         self.model.eval()
@@ -450,6 +501,10 @@ class BaselineSparseModel(BaselineModel):
                     m, Attention
                 )
                 m.save_attn = save_attn
+
+                m.peek_attn_recall = peek_attn_recall
+                if peek_attn_recall:
+                    m.init_attn_recall(minfer_config_path)
 
         self.model.apply(update_module)
 
@@ -471,6 +526,15 @@ class BaselineSparseModel(BaselineModel):
 
         attn_blocks = np.stack(attn_blocks, axis=1) # [BATCH, NUM_LAYERS, N_HEADS, N_BLOCKS, LAST_Q, K_BLOCK_SIZE]
         return attn_blocks
+    
+    def get_attn_recalls(self):
+        attn_recalls = []
+        for layer in self.model.model.layers:
+            attn_recall = layer.self_attn.attn_recalls # [BATCH, N_HEADS, LAST_Q]
+            attn_recalls.append(attn_recall)
+
+        attn_recalls = torch.stack(attn_recalls, dim=1) # [BATCH, NUM_LAYERS, N_HEADS, LAST_Q]
+        return attn_recalls
 
 class MInferSparseModel(MInferModel):
     def __init__(self, save_attn: bool=False, **kwargs):
@@ -578,7 +642,7 @@ def iter_for_attn_peek(args):
 
     
     attn_block_save_dir = os.path.join(
-        '/scratch/sync',
+        '/scratch/sync', "nnscaler_store", 
         args.gpu_set, args.expr_dir, args.expr_name, "checkpoints",
         f"{args.epoch_idx:04d}-{args.iter_idx:04d}", "attn_blocks"
     )
@@ -603,12 +667,13 @@ def iter_for_attn_peek(args):
 
                 print(f'Saving sparse ratio for batch {idx}...')
                 for l in range(NUM_LAYERS):
+                    if args.expr_name == "phi_lc_4k_131072" and l <= 2: continue
                     for h in range(NUM_HEADS):
+                        if args.expr_name == "phi_lc_4k_131072" and l == 3 and h <= 15: continue
                         for block_idx in range(NUM_ATTN_BLOCKS):
                             print(f"Saving attn block for layer {l}, head {h}, block {block_idx}...", end=' ', flush=True)
                             attn_block_save_path = os.path.join(
-                                # local_attn_save_dir,
-                                attn_block_save_dir.replace("/scratch/sync", "/scratch/eval"),
+                                attn_block_save_dir,
                                 f"sample_{num_samples}",
                                 f"layer_{l}", f"head_{h}", f"block_{block_idx}.npy"
                             )
@@ -624,6 +689,52 @@ def iter_for_attn_peek(args):
                 if args.debug: break
         if num_samples >= NUM_ATTN_SAMPLES: break
 
+
+def iter_for_attn_recall(args):
+    print('-' * 60)
+    print(f"Running Attention Recall Peeking", flush=True)
+    global NUM_ATTN_BLOCKS, NUM_ATTN_SAMPLES
+    if args.num_peek_blocks != NUM_ATTN_BLOCKS:
+        NUM_ATTN_BLOCKS = args.num_peek_blocks
+    if args.num_peek_samples != NUM_ATTN_SAMPLES:
+        NUM_ATTN_SAMPLES = args.num_peek_samples
+
+    
+    attn_recall_save_dir = os.path.join(
+        '/scratch/sync', "nnscaler_store", 
+        args.gpu_set, args.expr_dir, args.expr_name, "checkpoints",
+        f"{args.epoch_idx:04d}-{args.iter_idx:04d}", "attn_recalls"
+    )
+    local_attn_save_dir = attn_recall_save_dir.replace('/scratch/sync', '/scratch/eval')
+    os.makedirs(attn_recall_save_dir, exist_ok=True)
+    os.makedirs(local_attn_save_dir, exist_ok=True)
+
+    num_samples = 0
+    for idx, batches in data_iter:
+        with torch.no_grad():
+            for i, batch in enumerate(batches):
+                print("-" * 30)
+                start_time = time.perf_counter()
+                outputs = model(batch)
+                infer_time = time.perf_counter() - start_time
+
+                loss, _, _, _ = outputs
+                print(f"Batch {idx} | Sample {i} | Loss: {loss.cpu().numpy()} | Time: {infer_time:.3f} s", flush=True)
+
+                print(f'Saving attn recall for batch {idx}...', end=' ', flush=True)
+                attn_recalls = model.get_attn_recalls()[0] # [NUM_LAYERS, N_HEADS, LAST_Q]
+                attn_recall_save_path = os.path.join(
+                    attn_recall_save_dir,
+                    f"sample_{num_samples}.npy"
+                )
+                os.makedirs(os.path.dirname(attn_recall_save_path), exist_ok=True)
+                np.save(attn_recall_save_path, attn_recalls)
+                print('Done.', flush=True)
+
+                num_samples += 1
+                if num_samples >= NUM_ATTN_SAMPLES: break
+                if args.debug: break
+        if num_samples >= NUM_ATTN_SAMPLES: break
 
 def print_args(args):
     print('-' * 60)
@@ -662,6 +773,7 @@ if __name__ == '__main__':
     parser.add_argument('-p', "--peek_attn", action='store_true')
     parser.add_argument('--num_peek_blocks', type=int, default=10)
     parser.add_argument('--num_peek_samples', type=int, default=10)
+    parser.add_argument('--peek_attn_recall', action='store_true')
     args = parser.parse_args()
 
     torch.cuda.empty_cache()
@@ -707,15 +819,26 @@ if __name__ == '__main__':
     # Replace the Attention module 
     if 'mfmb' not in args.expr_name and 'mf_mb' not in args.expr_name:
         print(f"Using Baseline model for {args.expr_name}...")
+        if args.peek_attn_recall:
+            print(f"Attention Recall Peeking is enabled for baseline model.")
+
         PHI_ATTENTION_CLASSES['flash_attention_2'] = BaselineAttentionWSparse
         model_args = {
             "model_id": model_id,
         }
         if args.original:
             model_args['config_path'] = f"{os.getenv('NNSCALER_HOME')}/experiments/minfer_phi/phi3/lc_config"
+        if args.peek_attn_recall:
+            model_args['peek_attn_recall'] = True
+            model_args['minfer_config_path'] = f"/scratch/nnscaler/experiments/minfer_phi/minfer_modules/configs/{args.minfer_config}.json"
+
         model = BaselineSparseModel(save_attn=args.peek_attn, **model_args)
+        
     else:
         print(f"Using MInfer model for {args.expr_name}...")
+        if args.peek_attn_recall:
+            raise ValueError("Attention Recall Peeking is not supported for MInfer model.")
+
         PHI_ATTENTION_CLASSES['flash_attention_2'] = MInferAttentionWSparse
 
         minfer_config_path = f"/scratch/nnscaler/experiments/minfer_phi/minfer_modules/configs/{args.minfer_config}.json"

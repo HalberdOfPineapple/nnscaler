@@ -1,3 +1,3 @@
-from .pit_flash_attn import vs_attn_forward
+from .pit_flash_attn import vs_attn_forward, gen_block_indices
 from .block_sparse_flash_attn import bs_attn_forward
 from .streaming_kernels import streaming_forward
