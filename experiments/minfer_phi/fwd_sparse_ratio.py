@@ -55,7 +55,7 @@ from minfer_modifier_v2 import MInferAttention
 from train import get_tokenizer, BaselineModel, MInferModel
 
 
-with open("/blob/.secrets/sas_token", "r") as f:
+with open("/scratch/sync/.secrets/sas_token", "r") as f:
     SAS_TOKEN = f.read().strip()
 SAS_POSTFIX = f"?{SAS_TOKEN}"
 
@@ -65,7 +65,10 @@ DEVICE_2 = 'cuda:2'
 
 SEQ_LEN = 131072
 LAST_Q = 512
+K_BLOCK_SIZE = 4096
 TOPK = 1024
+NUM_ATTN_BLOCKS = 10
+NUM_ATTN_SAMPLES = 10
 
 NUM_GLOBAL_BATCHES = 2
 GLOBAL_BATCH_SIZE = 64
@@ -87,7 +90,7 @@ def run_cmd(cmd):
     return 0
 
 def transfer_by_cp(local_path, dir='upload'):
-    remote_path = local_path.replace('/scratch/eval', '/blob/nnscaler_store')
+    remote_path = local_path.replace('/scratch/eval', '/scratch/sync/nnscaler_store')
     os.makedirs(os.path.dirname(remote_path), exist_ok=True)
     if dir == 'upload':
         run_res = run_cmd([
@@ -254,6 +257,90 @@ def get_dataloader(
     return data_iter
 
 
+def cal_last_QK(
+    self,
+    hidden_states: torch.Tensor,
+    position_ids: Optional[torch.LongTensor],
+    past_key_value: Optional[Cache],
+):
+    output_attentions = False
+    bsz, q_len, _ = hidden_states.size()
+
+    qkv = self.qkv_proj(hidden_states)
+    query_pos = self.num_heads * self.head_dim
+    query_states = qkv[..., :query_pos]
+    key_states = qkv[..., query_pos : query_pos + self.num_key_value_heads * self.head_dim]
+    value_states = qkv[..., query_pos + self.num_key_value_heads * self.head_dim :]
+
+    # Flash attention requires the input to have the shape
+    # batch_size x seq_length x head_dim x hidden_dim
+    # therefore we just need to keep the original shape
+    query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
+    key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+    value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+
+    kv_seq_len = key_states.shape[-2]
+    if past_key_value is not None:
+        if self.layer_idx is None:
+            raise ValueError(
+                f"The cache structure has changed since version v4.36. If you are using {self.__class__.__name__} "
+                "for auto-regressive decoding with k/v caching, please make sure to initialize the attention class "
+                "with a layer index."
+            )
+        kv_seq_len += past_key_value.get_usable_length(kv_seq_len, self.layer_idx)
+
+    # Because the input can be padded, the absolute sequence length depends on the max position id.
+    rotary_seq_len = max(kv_seq_len, position_ids[:, -1].max().item()) + 1
+    cos, sin = self.rotary_emb(value_states, position_ids, seq_len=rotary_seq_len)
+    query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
+
+    # repeat k/v heads if n_kv_heads < n_heads
+    key_states = repeat_kv(key_states, self.num_key_value_groups)
+    value_states = repeat_kv(value_states, self.num_key_value_groups)
+
+    # ---------------------------------------
+    # print('-' * 30)
+    causal_mask = torch.arange(q_len - LAST_Q, q_len, device=DEVICE_2)[:, None] >= torch.arange(q_len, device=DEVICE_2)[None, :]
+    
+    # if self.layer_idx == 0:
+    #     print('-' * 60)
+    #     print(f"Before QK^T: query_states:\n{query_states}\nkey_states:\n{key_states}\n")
+    qk = torch.einsum(
+        f'bhmk, bhnk -> bhmn', 
+        query_states[:, :, -LAST_Q:, :].contiguous().to(DEVICE_2), # [BATCH, N_HEADS, LAST_Q, D_HEAD]
+        key_states.to(DEVICE_2), # [BATCH, N_HEADS, N_CTX, D_HEAD]
+    ) / math.sqrt(self.head_dim) # [BATCH, N_HEADS, LAST_Q, N_CTX]
+    qk = torch.where(causal_mask, qk, float('-inf'))
+    del causal_mask
+
+
+    attn_weights = torch.nn.functional.softmax(qk, dim=-1)
+    return attn_weights
+
+
+def get_sparse_ratio(
+    attn_weights: torch.Tensor,
+    topk: int = TOPK,
+):
+    topk_values, _ = torch.topk(attn_weights, topk, dim=-1)
+    sparse_ratio = torch.sum(topk_values, dim=-1).cpu()
+    return sparse_ratio
+
+def save_attn_blocks(
+    attn_weights: torch.Tensor,
+    k_bsz: int = K_BLOCK_SIZE,
+):
+    # attn_weights - [BATCH, N_HEADS, LAST_Q, SEQ_LEN]
+    attn_blocks = []
+    starting_indices = list(range(0, SEQ_LEN - K_BLOCK_SIZE, (SEQ_LEN - K_BLOCK_SIZE) // NUM_ATTN_BLOCKS))
+    starting_indices.append(SEQ_LEN - K_BLOCK_SIZE)
+    for i in starting_indices:
+        attn_block = attn_weights[..., i:i+k_bsz].cpu().numpy() # [BATCH, N_HEADS, LAST_Q, K_BLOCK_SIZE]
+        attn_blocks.append(attn_block)
+
+    attn_blocks = np.stack(attn_blocks, axis=2) # [BATCH, N_HEADS, N_BLOCKS, LAST_Q, K_BLOCK_SIZE]
+    return attn_blocks
+
 class BaselineAttentionWSparse(NNScalerPhiFlashAttention2):
     """
     Llama flash attention module. This module inherits from `LlamaAttention` as the weights of the module stays
@@ -269,6 +356,7 @@ class BaselineAttentionWSparse(NNScalerPhiFlashAttention2):
         # Beware that with flash_attn<2.1, using q_seqlen != k_seqlen (except for the case q_seqlen == 1) produces a wrong mask (top-left).
         self._flash_attn_uses_top_left_mask = not is_flash_attn_greater_or_equal_2_10()
         self.sparse_ratio: torch.Tensor = None
+        self.attn_blocks: np.ndarray = None
 
     def forward(
         self,
@@ -291,68 +379,26 @@ class BaselineAttentionWSparse(NNScalerPhiFlashAttention2):
             **kwargs,
         )
 
-        output_attentions = False
-        bsz, q_len, _ = hidden_states.size()
-
-        qkv = self.qkv_proj(hidden_states)
-        query_pos = self.num_heads * self.head_dim
-        query_states = qkv[..., :query_pos]
-        key_states = qkv[..., query_pos : query_pos + self.num_key_value_heads * self.head_dim]
-        value_states = qkv[..., query_pos + self.num_key_value_heads * self.head_dim :]
-
-        # Flash attention requires the input to have the shape
-        # batch_size x seq_length x head_dim x hidden_dim
-        # therefore we just need to keep the original shape
-        query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
-        key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
-        value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
-
-        kv_seq_len = key_states.shape[-2]
-        if past_key_value is not None:
-            if self.layer_idx is None:
-                raise ValueError(
-                    f"The cache structure has changed since version v4.36. If you are using {self.__class__.__name__} "
-                    "for auto-regressive decoding with k/v caching, please make sure to initialize the attention class "
-                    "with a layer index."
-                )
-            kv_seq_len += past_key_value.get_usable_length(kv_seq_len, self.layer_idx)
-
-        # Because the input can be padded, the absolute sequence length depends on the max position id.
-        rotary_seq_len = max(kv_seq_len, position_ids[:, -1].max().item()) + 1
-        cos, sin = self.rotary_emb(value_states, position_ids, seq_len=rotary_seq_len)
-        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
-
-        # repeat k/v heads if n_kv_heads < n_heads
-        key_states = repeat_kv(key_states, self.num_key_value_groups)
-        value_states = repeat_kv(value_states, self.num_key_value_groups)
-
-        # ---------------------------------------
-        # print('-' * 30)
-        causal_mask = torch.arange(q_len - LAST_Q, q_len, device=DEVICE_2)[:, None] >= torch.arange(q_len, device=DEVICE_2)[None, :]
+        attn_weights = self.cal_last_QK(hidden_states, position_ids, past_key_value)
+        self.sparse_ratio = get_sparse_ratio(attn_weights)
         
-        # if self.layer_idx == 0:
-        #     print('-' * 60)
-        #     print(f"Before QK^T: query_states:\n{query_states}\nkey_states:\n{key_states}\n")
-        qk = torch.einsum(
-            f'bhmk, bhnk -> bhmn', 
-            query_states[:, :, -LAST_Q:, :].contiguous().to(DEVICE_2), # [BATCH, N_HEADS, LAST_Q, D_HEAD]
-            key_states.to(DEVICE_2), # [BATCH, N_HEADS, N_CTX, D_HEAD]
-        ) / math.sqrt(self.head_dim) # [BATCH, N_HEADS, LAST_Q, N_CTX]
+        if self.save_attn:
+            self.attn_blocks = save_attn_blocks(attn_weights, k_bsz=K_BLOCK_SIZE) # [BATCH, N_HEADS, N_BLOCKS, LAST_Q, K_BLOCK_SIZE]
+            # print(f"BaselineAttentionWSparse attn_blocks shape: {self.attn_blocks.shape}")
 
-        qk = torch.where(causal_mask, qk, float('-inf'))
-        del causal_mask
-
-
-        attn_weights = torch.nn.functional.softmax(qk, dim=-1)
-
-        # Calculate the sum of topk elements at each row of the attention weights
-        topk_values, _ = torch.topk(attn_weights, TOPK, dim=-1)
-        self.sparse_ratio = torch.sum(topk_values, dim=-1).cpu() # [BATCH, N_HEAD, LAST_Q]
-        del qk, topk_values, attn_weights
-        
         return res
 
 class MInferAttentionWSparse(MInferAttention):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
+        # TODO: Should be removed once Flash Attention for RoCm is bumped to 2.1.
+        # flash_attn<2.1 generates top-left aligned causal mask, while what is needed here is bottom-right alignement, that was made default for flash_attn>=2.1. This attribute is used to handle this difference. Reference: https://github.com/Dao-AILab/flash-attention/releases/tag/v2.1.0.
+        # Beware that with flash_attn<2.1, using q_seqlen != k_seqlen (except for the case q_seqlen == 1) produces a wrong mask (top-left).
+        self._flash_attn_uses_top_left_mask = not is_flash_attn_greater_or_equal_2_10()
+        self.sparse_ratio: torch.Tensor = None
+        self.attn_blocks: np.ndarray = None
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -373,72 +419,39 @@ class MInferAttentionWSparse(MInferAttention):
             **kwargs,
         )
 
-        output_attentions = False
-        bsz, q_len, _ = hidden_states.size()
+        attn_weights = self.cal_last_QK(hidden_states, position_ids, past_key_value)
+        self.sparse_ratio = get_sparse_ratio(attn_weights)
 
-        qkv = self.qkv_proj(hidden_states)
-        query_pos = self.num_heads * self.head_dim
-        query_states = qkv[..., :query_pos]
-        key_states = qkv[..., query_pos : query_pos + self.num_key_value_heads * self.head_dim]
-        value_states = qkv[..., query_pos + self.num_key_value_heads * self.head_dim :]
-
-        # Flash attention requires the input to have the shape
-        # batch_size x seq_length x head_dim x hidden_dim
-        # therefore we just need to keep the original shape
-        query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
-        key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
-        value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
-
-        kv_seq_len = key_states.shape[-2]
-        if past_key_value is not None:
-            if self.layer_idx is None:
-                raise ValueError(
-                    f"The cache structure has changed since version v4.36. If you are using {self.__class__.__name__} "
-                    "for auto-regressive decoding with k/v caching, please make sure to initialize the attention class "
-                    "with a layer index."
-                )
-            kv_seq_len += past_key_value.get_usable_length(kv_seq_len, self.layer_idx)
-
-        # Because the input can be padded, the absolute sequence length depends on the max position id.
-        rotary_seq_len = max(kv_seq_len, position_ids[:, -1].max().item()) + 1
-        cos, sin = self.rotary_emb(value_states, position_ids, seq_len=rotary_seq_len)
-        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
-
-        # repeat k/v heads if n_kv_heads < n_heads
-        key_states = repeat_kv(key_states, self.num_key_value_groups)
-        value_states = repeat_kv(value_states, self.num_key_value_groups)
-
-        # ---------------------------------------
-        # print('-' * 30)
-        causal_mask = torch.arange(q_len - LAST_Q, q_len, device=DEVICE_2)[:, None] >= torch.arange(q_len, device=DEVICE_2)[None, :]
+        if self.save_attn:
+            # np.array
+            # [BATCH, N_HEADS, N_BLOCKS, LAST_Q, K_BLOCK_SIZE]
+            self.attn_blocks = save_attn_blocks(attn_weights, k_bsz=K_BLOCK_SIZE)
+            # print(f"MInferAttentionWSparse attn_blocks shape: {self.attn_blocks.shape}")
         
-        # if self.layer_idx == 0:
-        #     print('-' * 60)
-        #     print(f"Before QK^T: query_states:\n{query_states}\nkey_states:\n{key_states}\n")
-        qk = torch.einsum(
-            f'bhmk, bhnk -> bhmn', 
-            query_states[:, :, -LAST_Q:, :].contiguous().to(DEVICE_2), # [BATCH, N_HEADS, LAST_Q, D_HEAD]
-            key_states.to(DEVICE_2), # [BATCH, N_HEADS, N_CTX, D_HEAD]
-        ) / math.sqrt(self.head_dim) # [BATCH, N_HEADS, LAST_Q, N_CTX]
-        qk = torch.where(causal_mask, qk, float('-inf'))
-        del causal_mask
-
-
-        attn_weights = torch.nn.functional.softmax(qk, dim=-1)
-
-        # Calculate the sum of topk elements at each row of the attention weights
-        topk_values, _ = torch.topk(attn_weights, TOPK, dim=-1)
-        self.sparse_ratio = torch.sum(topk_values, dim=-1).cpu() # [BATCH, N_HEAD, LAST_Q]
-        del qk, topk_values, attn_weights
-
         return res
+    
+    # def cal_attn_recall(self, last_attn_weights: torch.Tensor):
+    #     # last_attn_weights - [BATCH, N_HEADS, LAST_Q, SEQ_LEN]
+    #     _, num_heads, _, _ = last_attn_weights.size()
+    #     for i in range(num_heads):
+        
 
 class BaselineSparseModel(BaselineModel):
-    def __init__(self, **kwargs):
+    def __init__(self, save_attn: bool=False, **kwargs):
         super().__init__(**kwargs)
         
         self.model = self.model.to(DEVICE_1)
         self.model.eval()
+
+        Attention = self.model.model.layers[0].self_attn.__class__
+        def update_module(m):
+            if isinstance(m, Attention):
+                m.cal_last_QK = cal_last_QK.__get__(
+                    m, Attention
+                )
+                m.save_attn = save_attn
+
+        self.model.apply(update_module)
 
     def get_sparse_ratio(self):
         sparse_ratios = []
@@ -449,13 +462,32 @@ class BaselineSparseModel(BaselineModel):
 
         sparse_ratios = torch.stack(sparse_ratios, dim=1)
         return sparse_ratios
+    
+    def get_attn_blocks(self):
+        attn_blocks = []
+        for layer in self.model.model.layers:
+            attn_block = layer.self_attn.attn_blocks # [BATCH, N_HEADS, N_BLOCKS, LAST_Q, K_BLOCK_SIZE]
+            attn_blocks.append(attn_block)
+
+        attn_blocks = np.stack(attn_blocks, axis=1) # [BATCH, NUM_LAYERS, N_HEADS, N_BLOCKS, LAST_Q, K_BLOCK_SIZE]
+        return attn_blocks
 
 class MInferSparseModel(MInferModel):
-    def __init__(self, **kwargs):
+    def __init__(self, save_attn: bool=False, **kwargs):
         super().__init__(**kwargs)
         
         self.model = self.model.to(DEVICE_1)
         self.model.eval()
+
+        Attention = self.model.model.layers[0].self_attn.__class__
+        def update_module(m):
+            if isinstance(m, Attention):
+                m.cal_last_QK = cal_last_QK.__get__(
+                    m, Attention
+                )
+                m.save_attn = save_attn
+
+        self.model.apply(update_module)
 
     def get_sparse_ratio(self):
         sparse_ratios = []
@@ -466,150 +498,29 @@ class MInferSparseModel(MInferModel):
 
         sparse_ratios = torch.stack(sparse_ratios, dim=1)
         return sparse_ratios
-
-
-if __name__ == '__main__':
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--expr_dir", type=str, required=True)
-    parser.add_argument("--expr_name", type=str, required=True)
-    parser.add_argument("--gpu_set", type=str, required=True)
-    parser.add_argument("--epoch_idx", type=int, required=True)
-    parser.add_argument("--iter_idx", type=int, required=True)
-    parser.add_argument("--original", action="store_true")
-    parser.add_argument('-d', '--debug', action='store_true')
-    parser.add_argument("-o", "--override", action="store_true")
-    parser.add_argument("--model_id", type=str, default=None)
-    args = parser.parse_args()
-
-    torch.cuda.empty_cache()
-
-    # ------------------------------------------------------------------
-    # Setting for Pretrained checkpoint
-    if not args.original:
-        model_id = f"/scratch/eval/{args.gpu_set}/minfer_phi/{args.expr_name}/checkpoints/{args.epoch_idx:04d}-{args.iter_idx:04d}/merged"
-    else:
-        print("Using the pretrained(original) model checkpoint...")
-        model_id = "microsoft/Phi-3-mini-4k-instruct" if args.model_id is None else args.model_id
-        args.epoch_idx = 0
-        args.iter_idx = 0
-
-
-    # ------------------------------------------------------------------
-    # Print Settings
-    print('-' * 60)
-    print(f"Experiment: {args.expr_name}")
-    print(f"GPU Set: {args.gpu_set}")
-    print(f"Epoch: {args.epoch_idx}")
-    print(f"Iteration: {args.iter_idx}")
-    print(f"Use Pretrained Checkpoint: {args.original}")
-    print(f"Debug: {args.debug}")
-    print('-' * 30)
-    print(f"Number of Global Batches: {NUM_GLOBAL_BATCHES}")
-    print(f"Global Batch Size: {GLOBAL_BATCH_SIZE}")
-    print(f"Micro Batch Size: {MICRO_BATCH_SIZE}")
-    print(f"Last Q: {LAST_Q}")
-    print(f"TopK: {TOPK}")
-    print('-' * 60)
-
-    # ------------------------------------------------------------------
-    # Set log file
-    import sys
-    log_file_path = os.path.join(
-        f'/blob/nnscaler_store/{args.gpu_set}', args.expr_dir, args.expr_name,
-        'checkpoints', f'{args.epoch_idx:04d}-{args.iter_idx:04d}', 'sparse_ratio.log'
-    )
-    os.makedirs(os.path.dirname(log_file_path), exist_ok=True)
-    try:
-        log_f = open(log_file_path, 'w')
-    except Exception as e:
-        print(f"Error opening log file {log_file_path}.")
-        log_file_path = log_file_path.replace('/blob/nnscaler_store', '/scratch/eval')
-        log_f = open(log_file_path, 'w')
-
-    print(f"Logging to {log_file_path}")
-    sys.stdout = log_f
-    sys.stderr = sys.stdout
-
-    print(f"Current time: {datetime.datetime.now()}")
-    print('-' * 60)
-    print(f"Experiment: {args.expr_name}")
-    print(f"Model ID: {model_id}")
-    print(f"GPU Set: {args.gpu_set}")
-    print(f"Epoch: {args.epoch_idx}")
-    print(f"Iteration: {args.iter_idx}")
-    print(f"Use Pretrained Checkpoint: {args.original}")
-    print(f"Debug: {args.debug}")
-    print('-' * 30)
-    print(f"Number of Global Batches: {NUM_GLOBAL_BATCHES}")
-    print(f"Global Batch Size: {GLOBAL_BATCH_SIZE}")
-    print(f"Micro Batch Size: {MICRO_BATCH_SIZE}")
-    print(f"Last Q: {LAST_Q}")
-    print(f"TopK: {TOPK}")
-    print('-' * 60)
-
-
-    # ------------------------------------------------------------------
-    # Replace the Attention module 
-    if 'mfmb' not in args.expr_name and 'mf_mb' not in args.expr_name:
-        print(f"Using Baseline model for {args.expr_name}...")
-        PHI_ATTENTION_CLASSES['flash_attention_2'] = BaselineAttentionWSparse
-        model_args = {
-            "model_id": model_id,
-        }
-        if args.original:
-            model_args['config_path'] = f"{os.getenv('NNSCALER_HOME')}/experiments/minfer_phi/phi3/lc_config"
-        model = BaselineSparseModel(**model_args)
-    else:
-        print(f"Using MInfer model for {args.expr_name}...")
-        PHI_ATTENTION_CLASSES['flash_attention_2'] = MInferAttentionWSparse
-
-        model_args = {
-            "model_id": model_id,
-            "minfer_config": {
-                # MInfer's config is the one searched from the pretrained (4k) version with LongRoPE
-                'config_path': "/scratch/nnscaler/experiments/minfer_phi/minfer_modules/configs/Phi-3-mini-4k-instruct-LongRoPE-128k.json",
-            },
-        }
-        if args.original:
-            model_args['config_path'] = f"{os.getenv('NNSCALER_HOME')}/experiments/minfer_phi/phi3/lc_config"
-        model = MInferSparseModel(**model_args)
-    print('-' * 60)
-    print(f"Model Config:")
-    print(model.model.config)
     
-    # ------------------------------------------------------------------#
-    # Set save path
-    sparse_ratio_save_url = (
-        f"https://chengzhang.blob.core.windows.net/wenxuanli/nnscaler_store/"
-        f"{args.gpu_set}/{args.expr_dir}/{args.expr_name}/checkpoints/"
-        f"{args.epoch_idx:04d}-{args.iter_idx:04d}/sparse_ratios/"
-    )
-    sparse_ratio_save_local_dir = os.path.join(
-        '/scratch/eval', args.gpu_set, args.expr_dir, args.expr_name, "checkpoints",
-        f"{args.epoch_idx:04d}-{args.iter_idx:04d}", "sparse_ratios"
-    )
-    os.makedirs(sparse_ratio_save_local_dir, exist_ok=True)
+    def get_attn_blocks(self):
+        attn_blocks = []
+        for layer in self.model.model.layers:
+            attn_block = layer.self_attn.attn_blocks # [BATCH, N_HEADS, N_BLOCKS, LAST_Q, K_BLOCK_SIZE]
+            attn_blocks.append(attn_block)
 
+        attn_blocks = np.stack(attn_blocks, axis=1) # [BATCH, NUM_LAYERS, N_HEADS, N_BLOCKS, LAST_Q, K_BLOCK_SIZE]
+        return attn_blocks
 
-    # ------------------------------------------------------------------
-    # Get dataloader
-    print("Getting dataloader...", end=" ")
-    data_iter = get_dataloader(model_id)
-    print("Done.")
-
-    # ------------------------------------------------------------------
-    # Iterate over the batches within a global batch
+def iter_for_sparse_ratio(args):
+    print('-' * 60)
+    print(f"Running Sparse Ratio Measurement Mode")
+    
     sys.stdout.flush()
     for idx, batches in data_iter:
         if idx >= NUM_GLOBAL_BATCHES: break
         print('-' * 60)
         print(f"Global batch {idx} with {len(batches)} micro batches")
-        save_url_idx = sparse_ratio_save_url + f"{str(idx)}.npy"
-        save_url_loss_idx = sparse_ratio_save_url + f"{str(idx)}_loss.npy"
         save_local_idx = os.path.join(sparse_ratio_save_local_dir, f"{str(idx)}.npy")
         save_local_loss_idx = os.path.join(sparse_ratio_save_local_dir, f"{str(idx)}_loss.npy")
         if (os.path.exists(save_local_idx) 
-            or os.path.exists(save_local_idx.replace('/scratch/eval', '/blob/nnscaler_store'))) \
+            or os.path.exists(save_local_idx.replace('/scratch/eval', '/scratch/sync/nnscaler_store'))) \
             and not args.override:
             print(f"Skipping batch {idx} because {save_local_idx} exists (use '--override' to override).")
             sys.stdout.flush()
@@ -634,7 +545,6 @@ if __name__ == '__main__':
                 sys.stdout.flush()
 
         print(f'Saving sparse ratio for batch {idx}...', end=' ')
-        
         np.save(save_local_idx, sparse_ratios)
         print('Done.')
 
@@ -655,10 +565,195 @@ if __name__ == '__main__':
         print('Done.')
 
         if args.debug: break
+
+
+def iter_for_attn_peek(args):
+    print('-' * 60)
+    print(f"Running Peek Attention Mode")
+    sys.stdout.flush()
+    global NUM_ATTN_BLOCKS, NUM_ATTN_SAMPLES
+    if args.num_peek_blocks != NUM_ATTN_BLOCKS:
+        NUM_ATTN_BLOCKS = args.num_peek_blocks
+    if args.num_peek_samples != NUM_ATTN_SAMPLES:
+        NUM_ATTN_SAMPLES = args.num_peek_samples
+
     
-    if not log_file_path.startswith('/blob/nnscaler_store'):
+    attn_block_save_dir = os.path.join(
+        '/scratch/sync',
+        args.gpu_set, args.expr_dir, args.expr_name, "checkpoints",
+        f"{args.epoch_idx:04d}-{args.iter_idx:04d}", "attn_blocks"
+    )
+    os.makedirs(attn_block_save_dir, exist_ok=True)
+
+    num_samples = 0
+    for idx, batches in data_iter:
+        attn_blocks = np.zeros((NUM_LAYERS, NUM_HEADS, NUM_ATTN_BLOCKS, LAST_Q, K_BLOCK_SIZE))
+        with torch.no_grad():
+            for i, batch in enumerate(batches):
+                attn_block_save_path = os.path.join(attn_block_save_dir, f"{str(num_samples)}.npy")
+                if os.path.exists(attn_block_save_path) and not args.override:
+                    print(f"Skipping sample {num_samples} because {attn_block_save_path} exists (use '--override' to override).")
+                    sys.stdout.flush()
+                    continue
+                
+
+                print("-" * 30)
+                start_time = time.perf_counter()
+                outputs = model(batch)
+                infer_time = time.perf_counter() - start_time
+
+                loss, _, _, _ = outputs
+
+                attn_blocks = model.get_attn_blocks()[0] # [NUM_LAYERS, N_HEADS, N_BLOCKS, LAST_Q, K_BLOCK_SIZE]
+                print(f"Batch {idx} | Sample {i} | Loss: {loss.cpu().numpy()} | Time: {infer_time:.3f} s")
+                sys.stdout.flush()
+
+                print(f'Saving sparse ratio for batch {idx}...', end=' ')
+                np.save(attn_block_save_path, attn_blocks)
+                print('Done.')
+                sys.stdout.flush()
+
+                num_samples += 1
+                if num_samples >= NUM_ATTN_SAMPLES: break
+                if args.debug: break
+        if num_samples >= NUM_ATTN_SAMPLES: break
+
+
+def print_args(args):
+    print('-' * 60)
+    print(f"Mode: {'Sparse Ratio Measurement' if not args.peek_attn else 'Peek Attention'}")
+    print(f"Experiment: {args.expr_name}")
+    print(f"GPU Set: {args.gpu_set}")
+    print(f"Epoch: {args.epoch_idx}")
+    print(f"Iteration: {args.iter_idx}")
+    print(f"Use Pretrained Checkpoint: {args.original}")
+    print(f"Debug: {args.debug}")
+    print('-' * 30)
+    print(f"Number of Global Batches: {NUM_GLOBAL_BATCHES}")
+    print(f"Global Batch Size: {GLOBAL_BATCH_SIZE}")
+    print(f"Micro Batch Size: {MICRO_BATCH_SIZE}")
+    print(f"Last Q: {LAST_Q}")
+    print(f"TopK: {TOPK}")
+    print('-' * 60)
+    if args.peek_attn:
+        print(f"Number of Peek Blocks: {args.num_peek_blocks}")
+        print(f"Number of Peek Samples: {args.num_peek_samples}")
+    print('-' * 60)
+
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--expr_dir", type=str, required=True)
+    parser.add_argument("--expr_name", type=str, required=True)
+    parser.add_argument("--gpu_set", type=str, required=True)
+    parser.add_argument("--epoch_idx", type=int, required=True)
+    parser.add_argument("--iter_idx", type=int, required=True)
+    parser.add_argument("--original", action="store_true")
+    parser.add_argument('-d', '--debug', action='store_true')
+    parser.add_argument("-o", "--override", action="store_true")
+    parser.add_argument("--model_id", type=str, default=None)
+    parser.add_argument('--minfer_config', type=str, default="Phi-3-mini-4k-instruct-LongRoPE-128k")
+    parser.add_argument('-p', "--peek_attn", action='store_true')
+    parser.add_argument('--num_peek_blocks', type=int, default=10)
+    parser.add_argument('--num_peek_samples', type=int, default=10)
+    args = parser.parse_args()
+
+    torch.cuda.empty_cache()
+
+    # ------------------------------------------------------------------
+    # Setting for Pretrained checkpoint
+    if not args.original:
+        model_id = f"/scratch/eval/{args.gpu_set}/minfer_phi/{args.expr_name}/checkpoints/{args.epoch_idx:04d}-{args.iter_idx:04d}/merged"
+    else:
+        print("Using the pretrained(original) model checkpoint...")
+        model_id = "microsoft/Phi-3-mini-4k-instruct" if args.model_id is None else args.model_id
+        args.epoch_idx = 0
+        args.iter_idx = 0
+
+    # ------------------------------------------------------------------
+    # Print Settings
+    print_args(args)
+
+    # ------------------------------------------------------------------
+    # Set log file
+    import sys
+    log_file_path = os.path.join(
+        f'/scratch/sync/nnscaler_store/{args.gpu_set}', args.expr_dir, args.expr_name,
+        'checkpoints', f'{args.epoch_idx:04d}-{args.iter_idx:04d}', 
+        'sparse_ratio.log' if not args.peek_attn else 'attn_peek.log'
+    )
+    os.makedirs(os.path.dirname(log_file_path), exist_ok=True)
+    try:
+        log_f = open(log_file_path, 'w')
+    except Exception as e:
+        print(f"Error opening log file {log_file_path}.")
+        log_file_path = log_file_path.replace('/scratch/sync/nnscaler_store', '/scratch/eval')
+        log_f = open(log_file_path, 'w')
+    
+    print(f"Logging to {log_file_path}")
+    sys.stdout = log_f
+    sys.stderr = sys.stdout
+    print_args(args)
+
+
+
+    # ------------------------------------------------------------------
+    # Replace the Attention module 
+    if 'mfmb' not in args.expr_name and 'mf_mb' not in args.expr_name:
+        print(f"Using Baseline model for {args.expr_name}...")
+        PHI_ATTENTION_CLASSES['flash_attention_2'] = BaselineAttentionWSparse
+        model_args = {
+            "model_id": model_id,
+        }
+        if args.original:
+            model_args['config_path'] = f"{os.getenv('NNSCALER_HOME')}/experiments/minfer_phi/phi3/lc_config"
+        model = BaselineSparseModel(save_attn=args.peek_attn, **model_args)
+    else:
+        print(f"Using MInfer model for {args.expr_name}...")
+        PHI_ATTENTION_CLASSES['flash_attention_2'] = MInferAttentionWSparse
+
+        minfer_config_path = f"/scratch/nnscaler/experiments/minfer_phi/minfer_modules/configs/{args.minfer_config}.json"
+        print(f"Using MInfer config at {minfer_config_path}")
+
+        model_args = {
+            "model_id": model_id,
+            "minfer_config": {
+                'config_path': minfer_config_path,
+            },
+        }
+        if args.original:
+            model_args['config_path'] = f"{os.getenv('NNSCALER_HOME')}/experiments/minfer_phi/phi3/lc_config"
+        model = MInferSparseModel(save_attn=args.peek_attn, **model_args)
+
+    print('-' * 60)
+    print(f"Model Config:")
+    print(model.model.config)
+    
+    # ------------------------------------------------------------------#
+    # Set save path
+    sparse_ratio_save_local_dir = os.path.join(
+        '/scratch/eval', args.gpu_set, args.expr_dir, args.expr_name, "checkpoints",
+        f"{args.epoch_idx:04d}-{args.iter_idx:04d}", "sparse_ratios"
+    )
+    os.makedirs(sparse_ratio_save_local_dir, exist_ok=True)
+
+
+    # ------------------------------------------------------------------
+    # Get dataloader
+    print("Getting dataloader...")
+    data_iter = get_dataloader(model_id)
+    print("Done.")
+
+    # ------------------------------------------------------------------
+    # Start Iteration
+    if args.peek_attn:
+        iter_for_attn_peek(args)
+    else:
+        iter_for_sparse_ratio(args)
+    
+    if not log_file_path.startswith('/scratch/sync/nnscaler_store'):
         log_f.close()
-        print(f"Copying log file to blob storage...", end=' ')
+        print(f"Copying log file to storage account...", end=' ')
         run_res = transfer_by_cp(log_file_path)
         if run_res != 0:
             print(f"Error uploading log file. Exiting...")

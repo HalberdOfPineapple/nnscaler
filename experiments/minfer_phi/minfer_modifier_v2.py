@@ -111,16 +111,13 @@ class MInferAttention(PhiAttention):
         # repeat k/v heads if n_kv_heads < n_heads
         key_states = repeat_kv(key_states, self.num_key_value_groups)
         value_states = repeat_kv(value_states, self.num_key_value_groups)
-
-        pattern = self.best_pattern.get(self.layer_idx, ("vertical_and_slash", 1000, 6096, 1))
-        # pattern = ("vertical_and_slash", 100, q_len, 1)
         head_indices = torch.arange(query_states.shape[1], device=query_states.device, dtype=torch.int32)
-
 
         # print(f"query_states: {query_states.shape}, key_states: {key_states.shape}, value_states: {value_states.shape}, head_indices: {head_indices.shape}")
         attn_output = attn_fwd_by_heads(
             query_states, key_states, value_states, head_indices,
-            bsz, q_len,  self.head_dim, self.layer_idx, pattern,
+            bsz, q_len,  self.head_dim, self.layer_idx, 
+            self.best_pattern,
         ) # expect:  b l^ {q_anno} vd^'
     
         attn_output = attn_output.reshape(bsz, q_len, self.hidden_size).contiguous()
@@ -138,7 +135,8 @@ def attn_fwd_by_heads(
     q_len: int,
     head_dim: int,
     layer_idx: int,
-    pattern: Tuple[str, int, int, int],
+    pattern_dict: Dict[int, Tuple[str, int, int, int]],
+    # pattern: Tuple[str, int, int, int],
 ):
     with torch.autograd.set_detect_anomaly(True):
         output_list = []
@@ -151,7 +149,11 @@ def attn_fwd_by_heads(
 
             # if search is disabled and the current layer is beyond  starting layer 
             # => apply the kernel for calculating the attention based on the best pattern
+            pattern = pattern_dict.get(head_indices[head].item(), ("vertical_and_slash", 100, 6096, 1))
             ty, vertical_size, slash_size, _ = pattern
+
+            print('-' * 30)
+            print(f"Layer {layer_idx} | Head {head_indices[head].item()} | Pattern {pattern}")
 
             try:
                 attn_output_head = vs_attn_forward(
@@ -167,13 +169,9 @@ def attn_fwd_by_heads(
                 
                 attn_output_head = torch.randn(bsz, 1, q_len, head_dim, device=query_states.device)
 
-            # output_list.append(attn_output_head.squeeze(2))
             output_list.append(attn_output_head)
-
-        # output = torch.stack(output_list, dim=2)
         output = torch.cat(output_list, dim=1)
     return output
-
 
 def minfer_attn_anno(query_states, key_states, value_states, *args, **kwargs) -> str:
     if query_states.shape[1] != key_states.shape[1]:
@@ -202,8 +200,6 @@ def attn_fwd_by_heads_v2(
     layer_idx: int,
     pattern: Tuple[str, int, int, int],
 ):
-    # print(f"head_indices: {head_indices}")
-
     torch.cuda.synchronize()
     with torch.autograd.set_detect_anomaly(True):
         num_heads = query_states.shape[1]
