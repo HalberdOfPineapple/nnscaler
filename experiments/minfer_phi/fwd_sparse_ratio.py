@@ -323,14 +323,11 @@ def build_sparse_mask(
 
             row_start = row_idx * block_size_M - (SEQ_LEN - LAST_Q)
             row_end = min(LAST_Q, row_start + block_size_M)
-            # print(f"Row-Dimension Start: {row_start} End: {row_end}")
 
             for i in range(block_cnt):
                 curr_block_start = block_off[i]
                 curr_block_end = min(SEQ_LEN, curr_block_start + block_size_N)
-                # print(f"Column-Dimension Start: {curr_block_start} End: {curr_block_end}")
 
-                # attn_mask[batch_idx, row_start:row_end, curr_block_start:curr_block_end] = 1
                 attn_mask[batch_idx, row_start:row_end, curr_block_start:curr_block_end] = \
                     torch.ones((row_end - row_start, curr_block_end - curr_block_start), device=DEVICE_2)
 
@@ -441,9 +438,10 @@ class BaselineAttentionWSparse(NNScalerPhiFlashAttention2):
                 query_states[:, :, -LAST_Q:, :].contiguous().to(DEVICE_2), # [BATCH, N_HEADS, LAST_Q, D_HEAD]
                 key_states.to(DEVICE_2), # [BATCH, N_HEADS, N_CTX, D_HEAD]
             ) / math.sqrt(self.head_dim) # [BATCH, N_HEADS, LAST_Q, N_CTX]
-            qk = torch.where(attn_mask & causal_mask[None, None, :, :], qk, float('-inf'))
-            
+            qk = torch.where(causal_mask, qk, float('-inf'))
             sparse_attn_weights = torch.nn.functional.softmax(qk, dim=-1)
+
+            sparse_attn_weights = torch.where(attn_mask, sparse_attn_weights, 0)
             self.attn_recalls = torch.sum(sparse_attn_weights, dim=-1).cpu().numpy() # [BATCH, N_HEADS, LAST_Q]
 
         return res
@@ -484,7 +482,10 @@ class MInferAttentionWSparse(MInferAttention):
             **kwargs,
         )
 
-        attn_weights = self.cal_last_QK(hidden_states, position_ids, past_key_value)
+        attn_weights, _, _, _ = self.cal_last_QK(
+            hidden_states, position_ids, past_key_value,
+            return_qkv=False,
+        )
         self.sparse_ratio = get_sparse_ratio(attn_weights)
 
         if self.save_attn:
@@ -571,7 +572,6 @@ class MInferSparseModel(MInferModel):
                     m, Attention
                 )
                 m.save_attn = save_attn
-
         self.model.apply(update_module)
 
     def get_sparse_ratio(self):
@@ -688,9 +688,7 @@ def iter_for_attn_peek(args):
 
                 print(f'Saving sparse ratio for batch {idx}...')
                 for l in range(NUM_LAYERS):
-                    if args.expr_name == "phi_lc_4k_131072" and l <= 2: continue
                     for h in range(NUM_HEADS):
-                        if args.expr_name == "phi_lc_4k_131072" and l == 3 and h <= 15: continue
                         for block_idx in range(NUM_ATTN_BLOCKS):
                             print(f"Saving attn block for layer {l}, head {h}, block {block_idx}...", end=' ', flush=True)
                             attn_block_save_path = os.path.join(
