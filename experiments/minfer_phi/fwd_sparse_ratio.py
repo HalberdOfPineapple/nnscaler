@@ -392,7 +392,7 @@ def cal_pooled_attn(
         pooled_Q, pooled_K
     ) / math.sqrt(pooled_Q.size(-1))
 
-    causal_mask = torch.arange(num_q_blocks, device=DEVICE_2)[:, None] >= torch.arange(num_q_blocks, device=DEVICE_2)[None, :] # [NUM_Q_BLOCKS, NUM_K_BLOCKS]
+    causal_mask = torch.arange(num_q_blocks, device=query_states.device)[:, None] >= torch.arange(num_q_blocks, device=query_states.device)[None, :] # [NUM_Q_BLOCKS, NUM_K_BLOCKS]
     pooled_results = torch.where(causal_mask, pooled_results, float('-inf'))
     pooled_results = torch.nn.functional.softmax(pooled_results, dim=-1)
     return pooled_results
@@ -892,21 +892,33 @@ def iter_for_pool_attn(args):
                 print(f"Batch {idx} | Sample {i} | Loss: {loss.cpu().numpy()} | Time: {infer_time:.3f} s", flush=True)
 
                 pooled_attn, attn_pooled = model.get_pooled_attn()
-                print(f'Saving pooled attn for batch {idx}...', end=' ', flush=True)
-                pooled_attn_save_path = os.path.join(
-                    pooled_attn_save_dir,
-                    f"sample_{num_samples}.npy"
-                )
-                np.save(pooled_attn_save_path, pooled_attn)
-                print('Done.', flush=True)
 
-                print(f'Saving attn pooled for batch {idx}...', end=' ', flush=True)
-                attn_pooled_save_path = os.path.join(
-                    attn_pooled_save_dir,
-                    f"sample_{num_samples}.npy"
-                )
-                np.save(attn_pooled_save_path, attn_pooled)
-                print('Done.', flush=True)
+                print('-' * 50)
+                for layer_idx in range(pooled_attn.shape[1]):
+                    for head_idx in range(pooled_attn.shape[2]):
+                        print(f'Saving pooled attn for Layer {layer_idx}, Head {head_idx} on batch {idx}...', end=' ', flush=True)
+                        pooled_attn_save_path = os.path.join(
+                            pooled_attn_save_dir,
+                            f"layer_{layer_idx}", f"head_{head_idx}",
+                            f"sample_{num_samples}.npy",
+                        )
+                        os.makedirs(os.path.dirname(pooled_attn_save_path), exist_ok=True)
+                        np.save(pooled_attn_save_path, pooled_attn[0, layer_idx, head_idx])
+                        print('Done.', flush=True)
+
+
+                print('-' * 50)
+                for layer_idx in range(attn_pooled.shape[1]):
+                    for head_idx in range(attn_pooled.shape[2]):
+                        print(f'Saving attn pooled for Layer {layer_idx}, Head {head_idx} on batch {idx}...', end=' ', flush=True)
+                        attn_pooled_save_path = os.path.join(
+                            attn_pooled_save_dir,
+                            f"layer_{layer_idx}", f"head_{head_idx}",
+                            f"sample_{num_samples}.npy",
+                        )
+                        os.makedirs(os.path.dirname(attn_pooled_save_path), exist_ok=True)
+                        np.save(attn_pooled_save_path, attn_pooled[0, layer_idx, head_idx])
+                        print('Done.', flush=True)
 
                 num_samples += 1
                 if num_samples >= NUM_ATTN_SAMPLES: break
