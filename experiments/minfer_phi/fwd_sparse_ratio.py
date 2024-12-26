@@ -1,4 +1,5 @@
 import os
+import yaml
 import json
 import time
 import math
@@ -61,6 +62,13 @@ MICRO_BATCH_SIZE = 1
 
 NUM_LAYERS = 32
 NUM_HEADS = 32
+
+IGNORE_IDX = -100
+MINFER_CONFIG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'configs')
+SPARSE_PATTERN_CONFIG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'minfer_modules', 'configs')
+SPARSE_HEAD_MAP_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'minfer_modules', 'sparse_head_maps')
+
+
 
 def run_cmd(cmd):
     result = subprocess.run(cmd)
@@ -1014,8 +1022,6 @@ if __name__ == '__main__':
     sys.stderr = sys.stdout
     print_args(args)
 
-
-
     # ------------------------------------------------------------------
     # Replace the Attention module 
     if 'mfmb' not in args.expr_name and 'mf_mb' not in args.expr_name:
@@ -1038,7 +1044,6 @@ if __name__ == '__main__':
             peek_pooled_attn=args.peek_pooled_attn,
             **model_args
         )
-
     else:
         print(f"Using MInfer model for {args.expr_name}...")
         if args.peek_attn_recall:
@@ -1046,14 +1051,17 @@ if __name__ == '__main__':
 
         PHI_ATTENTION_CLASSES['flash_attention_2'] = MInferAttentionWSparse
 
-        minfer_config_path = f"/scratch/nnscaler/experiments/minfer_phi/minfer_modules/configs/{args.minfer_config}.json"
-        print(f"Using MInfer config at {minfer_config_path}")
+        if 'mcontrol' in args.expr_name:
+            minfer_config_path = os.path.join(MINFER_CONFIG_DIR, f'mfmb_4k_base_iter_10.yaml')
+        else:
+            minfer_config_path = os.path.join(MINFER_CONFIG_DIR, f'mfmb_4k_config.yaml')
+        print(f'Using MInfer config at {minfer_config_path}')
+        with open(minfer_config_path, 'r') as f:
+            minfer_config = yaml.safe_load(f)
 
         model_args = {
-            "model_id": model_id,
-            "minfer_config": {
-                'config_path': minfer_config_path,
-            },
+            'model_id': model_id,
+            'minfer_config': minfer_config,
         }
         if args.original:
             model_args['config_path'] = f"{os.getenv('NNSCALER_HOME')}/experiments/minfer_phi/phi3/lc_config"
@@ -1062,8 +1070,8 @@ if __name__ == '__main__':
     print('-' * 60)
     print(f"Model Config:")
     print(model.model.config)
-    
-    # ------------------------------------------------------------------#
+
+    # ------------------------------------------------------------------ #
     # Set save path
     sparse_ratio_save_local_dir = os.path.join(
         '/scratch/eval', args.gpu_set, args.expr_dir, args.expr_name, "checkpoints",
