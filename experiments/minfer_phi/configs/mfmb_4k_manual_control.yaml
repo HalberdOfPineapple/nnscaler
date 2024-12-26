@@ -1,0 +1,2 @@
+config_path: experiments/minfer_phi/minfer_modules/configs/Phi-3-mini-4k-instruct-LongRoPE-128k.json
+sparse_head_map_path: experiments/minfer_phi/minfer_modules/sparse_head_maps/base_iter_10.json

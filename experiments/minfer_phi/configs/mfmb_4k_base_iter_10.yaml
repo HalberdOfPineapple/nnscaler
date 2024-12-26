@@ -1,0 +1,4 @@
+start_sparse_iter: 10
+start_sparse_layer: 4
+pattern_config_name: Phi-3-mini-4k-instruct-LongRoPE-128k
+sparse_head_map_name: base_iter_10

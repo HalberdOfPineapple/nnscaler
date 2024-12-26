@@ -3,6 +3,7 @@ import torch
 
 from datasets import load_from_disk
 from torch.utils.data import DataLoader
+from transformers import DataCollatorForLanguageModeling
 from typing import List, Optional, Tuple, Union, Any, Dict
 
 from nnscaler.utils import set_default_logger_level
@@ -13,6 +14,11 @@ from nnscaler.cli.trainer_args import (
     DatasetSamplerConfig,
     load_type
 )
+
+# how to import `get_tokenizer` in /scratch/nnscaler/experiments/minfer_phi/train.py?
+import sys
+sys.path.append('/scratch/nnscaler/experiments/minfer_phi')
+from train import get_tokenizer
 
 
 def get_dataloader(

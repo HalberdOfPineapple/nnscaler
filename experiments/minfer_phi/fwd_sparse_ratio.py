@@ -15,7 +15,6 @@ from transformers.cache_utils import Cache
 from transformers.models.llama.modeling_llama import LlamaRMSNorm as RMSNorm
 from transformers.utils import (
     is_flash_attn_greater_or_equal_2_10,
-    
 )
 
 from nnscaler.cli.trainer_args import (
@@ -35,6 +34,7 @@ from modeling_modifier import NNScalerPhiFlashAttention2
 from minfer_modifier_v2 import MInferAttention
 from train import get_tokenizer, BaselineModel, MInferModel
 from minfer_ops import gen_block_indices
+from fwd_utils import triton_flash_attn_with_block_score
 
 with open("/scratch/sync/.secrets/sas_token", "r") as f:
     SAS_TOKEN = f.read().strip()
@@ -49,7 +49,7 @@ LAST_Q = 512
 K_BLOCK_SIZE = 4096
 TOPK = 1024
 NUM_ATTN_BLOCKS = 10
-NUM_ATTN_SAMPLES = 10
+NUM_ATTN_SAMPLES = 5
 
 NUM_GLOBAL_BATCHES = 2
 GLOBAL_BATCH_SIZE = 64
@@ -336,7 +336,6 @@ def build_sparse_mask(
                 # attn_mask[batch_idx, row_start:row_end, col_index] = 1
                 attn_mask[batch_idx, row_start:row_end, col_index] = \
                     torch.ones((row_end - row_start), device=DEVICE_2)
-
     return attn_mask
 
 def get_sparse_ratio(
@@ -361,6 +360,58 @@ def save_attn_blocks(
 
     attn_blocks = np.stack(attn_blocks, axis=2) # [BATCH, N_HEADS, N_BLOCKS, LAST_Q, K_BLOCK_SIZE]
     return attn_blocks
+
+def avg_pool_tensor(x: torch.Tensor, block_size: int):
+    B, H, L, D = x.shape
+    
+    # (Optional) check that L is exactly divisible by block_size.
+    # If not, you may need to pad or handle the remainder in some way.
+    assert L % block_size == 0, "L must be divisible by block_size."
+    
+    # Reshape so that the dimension L is chunked into (L // block_size) blocks of size block_size
+    # Then, take the mean along that chunk dimension (dim=3 after reshaping).
+    x_reshaped = x.view(B, H, L // block_size, block_size, D)  # B x H x (L//block_size) x block_size x D
+    out = x_reshaped.mean(dim=3)                               # B x H x (L//block_size) x D
+
+    return out
+
+def cal_pooled_attn(
+    query_states: torch.Tensor,
+    key_states: torch.Tensor,
+    block_size_q: int = 64,
+    block_size_k: int = 64,
+):
+    # query_states - [BATCH, N_HEADS, N_CTX, D_HEAD]
+    # key_states - [BATCH, N_HEADS, N_CTX, D_HEAD]
+    q_len, k_len = query_states.size(2), key_states.size(2)
+    num_q_blocks, num_k_blocks = q_len // block_size_q, k_len // block_size_k
+    pooled_Q = avg_pool_tensor(query_states, block_size_q) # [BATCH, N_HEADS, NUM_Q_BLOCKS, D_HEAD]
+    pooled_K = avg_pool_tensor(key_states, block_size_k) # [BATCH, N_HEADS, NUM_K_BLOCKS, D_HEAD]
+    pooled_results = torch.einsum(
+        'bhqd, bhkd -> bhqk',
+        pooled_Q, pooled_K
+    ) / math.sqrt(pooled_Q.size(-1))
+
+    causal_mask = torch.arange(num_q_blocks, device=DEVICE_2)[:, None] >= torch.arange(num_q_blocks, device=DEVICE_2)[None, :] # [NUM_Q_BLOCKS, NUM_K_BLOCKS]
+    pooled_results = torch.where(causal_mask, pooled_results, float('-inf'))
+    pooled_results = torch.nn.functional.softmax(pooled_results, dim=-1)
+    return pooled_results
+
+def cal_attn_pooled(
+    query_states: torch.Tensor,
+    key_states: torch.Tensor,
+    value_states: torch.Tensor,
+    block_size_q: int = 64,
+    block_size_k: int = 64,
+):
+    _, attn_scores = triton_flash_attn_with_block_score(
+        query_states.transpose(1, 2).contiguous(), 
+        key_states.transpose(1, 2).contiguous(),
+        value_states.transpose(1, 2).contiguous(),
+        block_size_M=block_size_q, block_size_N=block_size_k
+    )
+    print(f"cal_attn_pooled attn_scores shape: {attn_scores.shape}")
+    return attn_scores # [BATCH, N_HEADS, NUM_Q_BLOCKS, NUM_K_BLOCKS]
 
 class BaselineAttentionWSparse(NNScalerPhiFlashAttention2):
     """
@@ -403,52 +454,87 @@ class BaselineAttentionWSparse(NNScalerPhiFlashAttention2):
         attn_weights, query_states, key_states, value_states = \
                 self.cal_last_QK(
                     hidden_states, position_ids, past_key_value, 
-                    return_qkv=self.peek_attn_recall,
+                    return_qkv=self.peek_attn_recall or self.pooled_results,
                 )
         self.sparse_ratio = get_sparse_ratio(attn_weights)
         
         if self.save_attn:
             self.attn_blocks = save_attn_blocks(attn_weights, k_bsz=K_BLOCK_SIZE) # [BATCH, N_HEADS, N_BLOCKS, LAST_Q, K_BLOCK_SIZE]
             # print(f"BaselineAttentionWSparse attn_blocks shape: {self.attn_blocks.shape}")
-        
+
         if self.peek_attn_recall:
-            attn_mask = []
-            for head_idx in range(NUM_HEADS):
-                pattern = self.best_pattern.get(head_idx, ("vertical_and_slash", 100, 6096, 1))
-                ty, vertical_size, slash_size, _ = pattern
-                block_count, block_offset, column_count, column_index, _ = gen_block_indices(
-                    query_states[:, head_idx].unsqueeze(1) , 
-                    key_states[:, head_idx].unsqueeze(1) ,
-                    value_states[:, head_idx].unsqueeze(1) ,
-                    SEQ_LEN, vertical_size, slash_size, self.head_dim,
-                    block_size_M=64, block_size_N=64
-                )
-
-                head_mask = build_sparse_mask(block_count, block_offset, column_count, column_index)
-                
-                attn_mask.append(head_mask)
-            attn_mask = torch.stack(attn_mask, dim=1) # [BATCH, N_HEADS, LAST_Q, SEQ_LEN]
-            # convert attn_mask to bool
-            attn_mask = attn_mask.bool()
-
-            causal_mask = torch.arange(SEQ_LEN - LAST_Q, SEQ_LEN, device=DEVICE_2)[:, None] >= torch.arange(SEQ_LEN, device=DEVICE_2)[None, :]
-
-            qk = torch.einsum(
-                f'bhmk, bhnk -> bhmn', 
-                query_states[:, :, -LAST_Q:, :].contiguous().to(DEVICE_2), # [BATCH, N_HEADS, LAST_Q, D_HEAD]
-                key_states.to(DEVICE_2), # [BATCH, N_HEADS, N_CTX, D_HEAD]
-            ) / math.sqrt(self.head_dim) # [BATCH, N_HEADS, LAST_Q, N_CTX]
-            qk = torch.where(causal_mask, qk, float('-inf'))
-            sparse_attn_weights = torch.nn.functional.softmax(qk, dim=-1)
-
-            sparse_attn_weights = torch.where(attn_mask, sparse_attn_weights, 0)
-            self.attn_recalls = torch.sum(sparse_attn_weights, dim=-1).cpu().numpy() # [BATCH, N_HEADS, LAST_Q]
+            self.attn_recalls = self.cal_attn_recall(query_states, key_states, value_states)
+        
+        if self.pooled_results:
+            self.pooled_attn, self.attn_pooled = self.cal_pooled_results(
+                query_states, key_states, value_states
+            )
 
         return res
     
+    def cal_pooled_results(
+            self,
+            query_states: torch.Tensor,
+            key_states: torch.Tensor,
+            value_states: torch.Tensor,
+            block_size_q: int = 64,
+            block_size_k: int = 64,
+    ):
+        print(f"Calculating pooled attn for Layer {self.layer_idx}...", end=' ', flush=True)
+        pooled_attn = cal_pooled_attn(
+            query_states, key_states, 
+            block_size_q, block_size_k
+        ).cpu().numpy() # [BATCH, N_HEADS, NUM_Q_BLOCKS, NUM_K_BLOCKS]
+        print('Done.', flush=True)
+
+        print(f"Calculating attn pooled for Layer {self.layer_idx}...", end=' ', flush=True)
+        attn_pooled = cal_attn_pooled(
+            query_states, key_states, value_states,
+            block_size_q, block_size_k
+        ).cpu().numpy() # [BATCH, N_HEADS, NUM_Q_BLOCKS, NUM_K_BLOCKS]
+        print('Done.', flush=True)
+
+        return pooled_attn, attn_pooled # [BATCH, N_HEADS, NUM_Q_BLOCKS, NUM_K_BLOCKS]
+
     def init_attn_recall(self, minfer_config_path: str):
         self.best_pattern = {int(ii): jj for ii, jj in json.load(open(minfer_config_path))[self.layer_idx].items()}
         print(f"[BaselineAttentionWSparse] MInfer config for {len(self.best_pattern)} heads in Layer {self.layer_idx} initialized")
+    
+    def cal_attn_recall(
+            self,
+            query_states: torch.Tensor,
+            key_states: torch.Tensor,
+            value_states: torch.Tensor,
+    ):
+        attn_mask = []
+        for head_idx in range(NUM_HEADS):
+            pattern = self.best_pattern.get(head_idx, ("vertical_and_slash", 100, 6096, 1))
+            ty, vertical_size, slash_size, _ = pattern
+            block_count, block_offset, column_count, column_index, _ = gen_block_indices(
+                query_states[:, head_idx].unsqueeze(1) , 
+                key_states[:, head_idx].unsqueeze(1) ,
+                value_states[:, head_idx].unsqueeze(1) ,
+                SEQ_LEN, vertical_size, slash_size, self.head_dim,
+                block_size_M=64, block_size_N=64
+            )
+
+            head_mask = build_sparse_mask(block_count, block_offset, column_count, column_index)
+            attn_mask.append(head_mask)
+
+        attn_mask = torch.stack(attn_mask, dim=1).bool() # [BATCH, N_HEADS, LAST_Q, SEQ_LEN]
+        causal_mask = torch.arange(SEQ_LEN - LAST_Q, SEQ_LEN, device=DEVICE_2)[:, None] >= torch.arange(SEQ_LEN, device=DEVICE_2)[None, :]
+
+        qk = torch.einsum(
+            f'bhmk, bhnk -> bhmn', 
+            query_states[:, :, -LAST_Q:, :].contiguous().to(DEVICE_2), # [BATCH, N_HEADS, LAST_Q, D_HEAD]
+            key_states.to(DEVICE_2), # [BATCH, N_HEADS, N_CTX, D_HEAD]
+        ) / math.sqrt(self.head_dim) # [BATCH, N_HEADS, LAST_Q, N_CTX]
+        qk = torch.where(causal_mask, qk, float('-inf'))
+
+        sparse_attn_weights = torch.nn.functional.softmax(qk, dim=-1)
+        sparse_attn_weights = torch.where(attn_mask, sparse_attn_weights, 0)
+
+        return torch.sum(sparse_attn_weights, dim=-1).cpu().numpy() # [BATCH, N_HEADS, LAST_Q]
 
         
 class MInferAttentionWSparse(MInferAttention):
@@ -502,6 +588,7 @@ class BaselineSparseModel(BaselineModel):
             save_attn: bool=False, 
             peek_attn_recall: bool=False,
             minfer_config_path: str = None,
+            peek_pooled_attn: bool = False,
             **kwargs
         ):
         super().__init__(**kwargs)
@@ -523,6 +610,8 @@ class BaselineSparseModel(BaselineModel):
                 m.peek_attn_recall = peek_attn_recall
                 if peek_attn_recall:
                     m.init_attn_recall(minfer_config_path)
+                
+                m.pooled_results = peek_pooled_attn
 
         self.model.apply(update_module)
 
@@ -557,6 +646,20 @@ class BaselineSparseModel(BaselineModel):
 
         attn_recalls = np.stack(attn_recalls, axis=1) # [BATCH, NUM_LAYERS, N_HEADS, LAST_Q]
         return attn_recalls
+    
+    def get_pooled_attn(self):
+        pooled_attn = []
+        attn_pooled = []
+        for i, layer in enumerate(self.model.model.layers):
+            try:
+                pooled_attn.append(layer.self_attn.pooled_attn)
+                attn_pooled.append(layer.self_attn.attn_pooled)
+            except AttributeError:
+                print(f"[Warning] Layer {i} does not have pooled_attn or attn_pooled attribute. Skipping...")
+                continue
+        pooled_attn = np.stack(pooled_attn, axis=1) # [BATCH, NUM_LAYERS, N_HEADS, NUM_Q_BLOCKS, NUM_K_BLOCKS]
+        attn_pooled = np.stack(attn_pooled, axis=1) # [BATCH, NUM_LAYERS, N_HEADS, NUM_Q_BLOCKS, NUM_K_BLOCKS]
+        return pooled_attn, attn_pooled
 
 class MInferSparseModel(MInferModel):
     def __init__(self, save_attn: bool=False, **kwargs):
@@ -756,6 +859,62 @@ def iter_for_attn_recall(args):
         if num_samples >= NUM_ATTN_SAMPLES: break
         if args.debug: break
 
+
+
+def iter_for_pool_attn(args):
+    global NUM_ATTN_SAMPLES
+    if args.num_peek_samples != NUM_ATTN_SAMPLES:
+        NUM_ATTN_SAMPLES = args.num_peek_samples
+
+    print('-' * 60)
+    print(f"Running Pool Attention Peeking", flush=True)
+    attn_save_dir = os.path.join(
+        '/scratch/sync', "nnscaler_store", 
+        args.gpu_set, args.expr_dir, args.expr_name, "checkpoints",
+        f"{args.epoch_idx:04d}-{args.iter_idx:04d}"
+    )
+    pooled_attn_save_dir = os.path.join(attn_save_dir, "pooled_attn")
+    attn_pooled_save_dir = os.path.join(attn_save_dir, "attn_pooled")
+    
+    os.makedirs(pooled_attn_save_dir, exist_ok=True)
+    os.makedirs(attn_pooled_save_dir, exist_ok=True)
+
+    num_samples = 0
+    for idx, batches in data_iter:
+        with torch.no_grad():
+            for i, batch in enumerate(batches):
+                print("-" * 30)
+                start_time = time.perf_counter()
+                outputs = model(batch)
+                infer_time = time.perf_counter() - start_time
+
+                loss, _, _, _ = outputs
+                print(f"Batch {idx} | Sample {i} | Loss: {loss.cpu().numpy()} | Time: {infer_time:.3f} s", flush=True)
+
+                pooled_attn, attn_pooled = model.get_pooled_attn()
+                print(f'Saving pooled attn for batch {idx}...', end=' ', flush=True)
+                pooled_attn_save_path = os.path.join(
+                    pooled_attn_save_dir,
+                    f"sample_{num_samples}.npy"
+                )
+                np.save(pooled_attn_save_path, pooled_attn)
+                print('Done.', flush=True)
+
+                print(f'Saving attn pooled for batch {idx}...', end=' ', flush=True)
+                attn_pooled_save_path = os.path.join(
+                    attn_pooled_save_dir,
+                    f"sample_{num_samples}.npy"
+                )
+                np.save(attn_pooled_save_path, attn_pooled)
+                print('Done.', flush=True)
+
+                num_samples += 1
+                if num_samples >= NUM_ATTN_SAMPLES: break
+                if args.debug: break
+
+        if num_samples >= NUM_ATTN_SAMPLES: break
+        if args.debug: break
+
 def print_args(args):
     print('-' * 60)
     print(f"Mode: {'Sparse Ratio Measurement' if not args.peek_attn else 'Peek Attention'}")
@@ -794,6 +953,7 @@ if __name__ == '__main__':
     parser.add_argument('--num_peek_blocks', type=int, default=10)
     parser.add_argument('--num_peek_samples', type=int, default=10)
     parser.add_argument('--peek_attn_recall', action='store_true')
+    parser.add_argument('--peek_pooled_attn', action='store_true')
     args = parser.parse_args()
 
     torch.cuda.empty_cache()
@@ -819,6 +979,8 @@ if __name__ == '__main__':
         log_file_name = 'attn_peek.log'
     elif args.peek_attn_recall:
         log_file_name = 'attn_recall_peek.log'
+    elif args.peek_pooled_attn:
+        log_file_name = 'pooled_attn.log'
     else:
         log_file_name = 'sparse_ratio.log'
 
@@ -859,8 +1021,12 @@ if __name__ == '__main__':
             model_args['peek_attn_recall'] = True
             model_args['minfer_config_path'] = f"/scratch/nnscaler/experiments/minfer_phi/minfer_modules/configs/{args.minfer_config}.json"
 
-        model = BaselineSparseModel(save_attn=args.peek_attn, **model_args)
-        
+        model = BaselineSparseModel(
+            save_attn=args.peek_attn, 
+            peek_pooled_attn=args.peek_pooled_attn,
+            **model_args
+        )
+
     else:
         print(f"Using MInfer model for {args.expr_name}...")
         if args.peek_attn_recall:
@@ -906,6 +1072,8 @@ if __name__ == '__main__':
         iter_for_attn_peek(args)
     elif args.peek_attn_recall:
         iter_for_attn_recall(args)
+    elif args.peek_pooled_attn:
+        iter_for_pool_attn(args)
     else:
         iter_for_sparse_ratio(args)
     

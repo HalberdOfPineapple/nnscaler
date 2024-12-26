@@ -22,17 +22,33 @@ from nnscaler.graph.parser.register import register_op
 from nnscaler.ir import IRTensor
 
 from minfer_ops import vs_attn_forward
-from phi3 import Phi3Attention as PhiAttention, apply_rotary_pos_emb, repeat_kv
+from phi3 import Phi3Attention, apply_rotary_pos_emb, repeat_kv
+from modeling_modifier import nnscaler_flash_attention_forward
+from custom_trainer import get_iter_cnt
+
+from transformers.utils import is_flash_attn_2_available
+if is_flash_attn_2_available():
+    from flash_attn import flash_attn_func
 
 
-class MInferAttention(PhiAttention):
+class MInferAttention(Phi3Attention):
     """
     Llama flash attention module. This module inherits from `LlamaAttention` as the weights of the module stays
     untouched. The only required change would be on the forward pass where it needs to correctly call the public API of
     flash attention and deal with padding tokens in case the input contains any of them.
     """
 
-    def init_minference_parameters(self):
+    def init_minference_parameters(
+            self,
+            start_sparse_iter: int = 0,
+            enable_sparse: bool = True,
+            adaptive_sparse: bool = False,
+            sparse_head_list: Optional[List[bool]] = None,
+    ):
+        self.start_sparse_iter = start_sparse_iter
+        self.enable_sparse = enable_sparse
+        self.adaptive_sparse = adaptive_sparse and self.enable_sparse
+        
         config = self.config.to_dict()
         self.starting_layer = config.get("starting_layer", 0)
         self.is_search = config.get("is_search", False)
@@ -51,6 +67,8 @@ class MInferAttention(PhiAttention):
 
         # import apply_rotary_pos_emb
         self.apply_rotary_pos_emb = True
+
+        self.sparse_head_list = sparse_head_list
 
     def forward(
         self,
@@ -113,18 +131,105 @@ class MInferAttention(PhiAttention):
         value_states = repeat_kv(value_states, self.num_key_value_groups)
         head_indices = torch.arange(query_states.shape[1], device=query_states.device, dtype=torch.int32)
 
-        # print(f"query_states: {query_states.shape}, key_states: {key_states.shape}, value_states: {value_states.shape}, head_indices: {head_indices.shape}")
-        attn_output = attn_fwd_by_heads(
+        # # print(f"query_states: {query_states.shape}, key_states: {key_states.shape}, value_states: {value_states.shape}, head_indices: {head_indices.shape}")
+        # curr_iter = get_iter_cnt(torch.distributed.get_rank())
+        # if curr_iter >= self.start_sparse_iter: 
+        #     print(
+        #         f'{__name__} | Current iteration: {curr_iter} < Start sparse iteration: {self.start_sparse_iter}, sparse is disabled', 
+        #         flush=True
+        #     )
+        # enable_sparse = self.enable_sparse and curr_iter >= self.start_sparse_iter
+        # if enable_sparse and self.adaptive_sparse:
+        #     raise NotImplementedError("Adaptive sparse is not implemented yet")
+        # elif enable_sparse:
+        #     attn_output = attn_fwd_by_heads(
+        #         query_states, key_states, value_states, head_indices,
+        #         bsz, q_len, self.head_dim, self.layer_idx, 
+        #         self.best_pattern,
+        #         self.sparse_head_list,
+        #     ) # expect:  b {q_anno} l^ vd^'
+        # else:
+        #     if curr_iter >= self.start_sparse_iter: 
+        #         print(
+        #             f'{__name__} | Current iteration: {curr_iter} < Start sparse iteration: {self.start_sparse_iter}, sparse is disabled', 
+        #             flush=True
+        #         )
+        #     else:
+        #         print(f'{__name__} | Layer {self.layer_idx} is disabled to use sparse', flush=True)
+        #     attn_output = nnscaler_flash_attention_forward(
+        #         query_states.transpose(1, 2),
+        #         key_states.transpose(1, 2),
+        #         value_states.transpose(1, 2),
+        #         attention_mask,
+        #         q_len,
+        #         causal=True,
+        #     ).transpose(1, 2) # [B, H, L, D]
+        attn_output = selective_attn_fwd(
             query_states, key_states, value_states, head_indices,
             bsz, q_len, self.head_dim, self.layer_idx, 
-            self.best_pattern,
-        ) # expect:  b l^ {q_anno} vd^'
+            self.adaptive_sparse, self.start_sparse_iter, self.enable_sparse,
+            self.best_pattern, self.sparse_head_list, attention_mask,
+        )
 
         attn_output = attn_output.reshape(bsz, q_len, self.hidden_size).contiguous()
         attn_output = self.o_proj(attn_output)
 
         if not output_attentions: attn_weights = None
         return attn_output, attn_weights, past_key_value
+
+
+def selective_attn_fwd(
+    query_states: torch.Tensor,
+    key_states: torch.Tensor,
+    value_states: torch.Tensor,
+    head_indices: torch.Tensor,
+    bsz: int,
+    q_len: int,
+    head_dim: int,
+    layer_idx: int,
+
+    adaptive_sparse: bool,
+    start_sparse_iter: int,
+    layer_enable_sparse: bool,
+    pattern_dict: Dict[int, Tuple[str, int, int, int]],
+    sparse_head_list: Optional[List[int]],
+    attention_mask: Optional[torch.Tensor],
+):
+    # print(f"query_states: {query_states.shape}, key_states: {key_states.shape}, value_states: {value_states.shape}, head_indices: {head_indices.shape}")
+    curr_iter = get_iter_cnt(torch.distributed.get_rank())
+    if curr_iter >= start_sparse_iter: 
+        print(
+            f'{__name__} | Current iteration: {curr_iter} < Start sparse iteration: {start_sparse_iter}, sparse is disabled', 
+            flush=True
+        )
+    enable_sparse = layer_enable_sparse and curr_iter >= start_sparse_iter
+    if enable_sparse and adaptive_sparse:
+        raise NotImplementedError("Adaptive sparse is not implemented yet")
+    elif enable_sparse:
+        attn_output = attn_fwd_by_heads(
+            query_states, key_states, value_states, head_indices,
+            bsz, q_len, head_dim, layer_idx, 
+            pattern_dict,
+            sparse_head_list,
+        ) # expect:  b {q_anno} l^ vd^'
+    else:
+        if curr_iter < start_sparse_iter: 
+            print(
+                f'{__name__} | Current iteration: {curr_iter} < Start sparse iteration: {start_sparse_iter}, sparse is disabled', 
+                flush=True
+            )
+        else:
+            print(f'{__name__} | Layer {layer_idx} is disabled to use sparse', flush=True)
+
+        attn_output = nnscaler_flash_attention_forward(
+            query_states.transpose(1, 2),
+            key_states.transpose(1, 2),
+            value_states.transpose(1, 2),
+            attention_mask,
+            q_len,
+            causal=True,
+        ).transpose(1, 2) # [B, H, L, D]
+    return attn_output
 
 def attn_fwd_by_heads(
     query_states: torch.Tensor,
@@ -136,40 +241,54 @@ def attn_fwd_by_heads(
     head_dim: int,
     layer_idx: int,
     pattern_dict: Dict[int, Tuple[str, int, int, int]],
+    sparse_head_list: Optional[List[int]] = None,
     # pattern: Tuple[str, int, int, int],
 ):
+    if sparse_head_list is None: 
+        sparse_head_list = [True] * query_states.size(1)
+
     with torch.autograd.set_detect_anomaly(True):
         output_list = []
         assert(query_states.shape[1] == head_indices.shape[-1])
 
         for head in range(query_states.size(1)):
+            head_idx = head_indices[head].item()
             q = query_states[:, head, :, :].unsqueeze(1) # (bsz, 1, q_len, head_dim)
             k = key_states[:, head, :, :].unsqueeze(1)
             v = value_states[:, head, :, :].unsqueeze(1)
 
             # if search is disabled and the current layer is beyond  starting layer 
             # => apply the kernel for calculating the attention based on the best pattern
-            pattern = pattern_dict.get(head_indices[head].item(), ("vertical_and_slash", 100, 6096, 1))
-            ty, vertical_size, slash_size, _ = pattern
+            if sparse_head_list[head_idx]:
+                pattern = pattern_dict.get(head_idx, ("vertical_and_slash", 100, 6096, 1))
+                ty, vertical_size, slash_size, _ = pattern
 
-            # print('-' * 30)
-            # print(f"Layer {layer_idx} | Head {head_indices[head].item()} | Pattern {pattern}")
+                print(f"Layer {layer_idx} | Head {head_indices[head].item()} | Pattern {pattern}", flush=True)
 
-            try:
-                attn_output_head = vs_attn_forward(
-                    q, k, v,
-                    q_len, vertical_size, slash_size, head_dim,
-                    layer_idx, head_indices[head].item()
-                ).view(bsz, 1, q_len, head_dim)
-            except Exception as e:
-                print(f"Error in (Layer {layer_idx}, Head {head_indices[head].item()}) with pattern {pattern}")
+                try:
+                    attn_output_head = vs_attn_forward(
+                        q, k, v,
+                        q_len, vertical_size, slash_size, head_dim,
+                        layer_idx, head_indices[head].item()
+                    ).view(bsz, 1, q_len, head_dim)
+                except Exception as e:
+                    print(f"Error in (Layer {layer_idx}, Head {head_indices[head].item()}) with pattern {pattern}")
 
-                import traceback
-                traceback.print_exc()
-                
-                attn_output_head = torch.randn(bsz, 1, q_len, head_dim, device=query_states.device)
+                    import traceback
+                    traceback.print_exc()
+ 
+                    attn_output_head = torch.randn(bsz, 1, q_len, head_dim, device=query_states.device)
 
-            output_list.append(attn_output_head)
+                output_list.append(attn_output_head)
+            else:
+                print(f"Layer {layer_idx} | Head {head_indices[head].item()} | Sparsity disabled", flush=True)
+                attn_output_head = flash_attn_func(
+                    q.transpose(1, 2),
+                    k.transpose(1, 2),
+                    v.transpose(1, 2),
+                    causal=True,
+                ).transpose(1, 2)
+    
         output = torch.cat(output_list, dim=1)
     return output
 
@@ -187,7 +306,8 @@ def minfer_attn_anno(query_states, key_states, value_states, *args, **kwargs) ->
     return f'b {q_anno} l^ hd^, b {kv_anno} s^ hd^, b {kv_anno} s^ vd^, {q_anno} -> b {q_anno} l^ vd^'
 
 if __name__ != "__main__":
-    register_op(minfer_attn_anno)(attn_fwd_by_heads)
+    # register_op(minfer_attn_anno)(attn_fwd_by_heads)
+    register_op(minfer_attn_anno)(selective_attn_fwd)
 
 def attn_fwd_by_heads_v2(
     query_states: torch.Tensor,
@@ -218,12 +338,11 @@ def attn_fwd_by_heads_v2(
     return output
 
 
-
+ATOL, RTOL = 5e-2, 5e-2
 # -----------------------------------------------------------
 def test_wo_chunks(attn_ver: int=1):
     from flash_attn import flash_attn_func
-    ATOL, RTOL = 5e-2, 5e-2
-
+    
     batch_size = 1
     context_size = 131072
     num_heads = 32

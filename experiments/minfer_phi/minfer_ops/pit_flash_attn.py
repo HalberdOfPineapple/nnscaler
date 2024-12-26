@@ -355,7 +355,7 @@ def _triton_mixed_sparse_attn_fwd_kernel(
         # acc_scale is the fix factor (exp(m_old - m_new))
         # multiply the previous accumulator by the fix factor and add the new value 
         acc = acc * acc_scale[:, None] + tl.dot(p.to(dtype), v)
-
+    
         # -- update m_i and l_i --
         # l_i is the a BLOCK_M vector with each element being the sum of the corresponding row (exponential of qk)
         l_i = l_i * alpha + tl.sum(p, 1)

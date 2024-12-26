@@ -5,6 +5,7 @@ import yaml
 import torch
 import datasets
 import argparse
+import numpy as np
 import huggingface_hub
 from typing import Dict, List
 from datasets import load_from_disk
@@ -36,6 +37,8 @@ logger = logging.getLogger(__name__)
 
 IGNORE_IDX = -100
 MINFER_CONFIG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'configs')
+SPARSE_PATTERN_CONFIG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'minfer_modules', 'configs')
+SPARSE_HEAD_MAP_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'minfer_modules', 'sparse_head_maps')
 
 
 # define a enumerate class for MInfer type
@@ -124,7 +127,7 @@ def minfer_patch_setup(model, minfer_config: MInferenceConfig):
     return model
 
 class BaselineModel(torch.nn.Module):
-    def __init__(self, model_id, config_path: str=None, selected_layers: List[int]=[]):
+    def __init__(self, model_id, config_path: str=None):
         super().__init__()
         from phi3 import Phi3ForCausalLM
 
@@ -140,8 +143,6 @@ class BaselineModel(torch.nn.Module):
                 model_id,
                 config=model_config,
             )
-        if len(selected_layers) > 0:
-            self.model.model.layers = torch.nn.ModuleList([self.model.model.layers[i] for i in selected_layers])
             
         print(f'{__name__} BaselineModel Selt-Attention Class: {self.model.model.layers[0].self_attn.__class__.__name__}')
 
@@ -159,14 +160,42 @@ class BaselineModel(torch.nn.Module):
         return loss, loss.data, samples['ntokens'], samples['nsentences']
 
 class MInferModel(BaselineModel):
-    def __init__(self, model_id, config_path: str=None, minfer_config: Dict={}, selected_layers: List[int]=[]):
+    def __init__(
+            self, 
+            model_id, 
+            config_path: str=None, 
+            minfer_config: Dict={},
+    ):
         super().__init__(
             model_id=model_id,
             config_path=config_path,
-            selected_layers=selected_layers,
         )
 
+        # --------------------------------------------
+        # Sparse iteratio, layer and head control
+        start_sparse_iter: int = minfer_config.pop('start_sparse_iter', 0)
+        start_sparse_layer: int = minfer_config.pop('start_sparse_layer', 0)
+        adaptive_sparse: bool = minfer_config.pop('adaptive_sparse', False)
+        sparse_head_map_name: str = minfer_config.pop('sparse_head_map_name', None)
+        if sparse_head_map_name is not None:
+            active_sparse_map_path: str = os.path.join(
+                SPARSE_HEAD_MAP_DIR,
+                f'{sparse_head_map_name}.npy',
+            )
+            print(f"{__name__} | Active Sparse Head Map Path: {active_sparse_map_path}")
+            active_sparse_map: np.ndarray = np.load(active_sparse_map_path)
+            active_sparse_map: List[List[bool]] = active_sparse_map.tolist()
+        else:
+            active_sparse_map: List[List[bool]] = None
+
+        # --------------------------------------------
+        # Standard MInference Setup
         minfer_attn_type = minfer_config.pop('attn_type', 'minference')
+        minfer_config['config_path'] = os.path.join(
+            SPARSE_PATTERN_CONFIG_DIR,
+            f'{minfer_config.pop("pattern_config_name")}.json',
+        )
+        print(f"{__name__} | MInference Pattern Config Path: {minfer_config['config_path']}")
         minfer = MInference(
             attn_type=minfer_attn_type,
             model_name=model_id,
@@ -174,16 +203,26 @@ class MInferModel(BaselineModel):
         )
         minfer_config: MInferenceConfig = minfer.config
         
+        # --------------------------------------------
+        # Patch the model
         self.model = minfer_patch_setup(self.model, minfer_config)
 
+        # --------------------------------------------
+        # Initialize MInference parameters for each attention module
         Attention = self.model.model.layers[0].self_attn.__class__
         def update_module(m):
             if isinstance(m, Attention):
-                m.init_minference_parameters()
+                enable_sparse = \
+                    m.layer_idx >= start_sparse_layer and \
+                    (active_sparse_map is None or any(active_sparse_map[m.layer_idx]))
+
+                m.init_minference_parameters(
+                    start_sparse_iter=start_sparse_iter,
+                    enable_sparse=enable_sparse,
+                    adaptive_sparse=adaptive_sparse,
+                    sparse_head_list=None if active_sparse_map is None else active_sparse_map[m.layer_idx],
+                )
         self.model.apply(update_module)
-
-        # self.model = minfer_phi_init(self.model, model_id, minfer_config)
-
 
 def aggregate_outputs_fn(loss_outputs, sync_group) -> AggregatedOutputs:
     losses, ntokens_info = [], []
@@ -214,7 +253,7 @@ def main(args):
     #     base_port = 5678
     #     port = base_port + int(os.environ["LOCAL_RANK"])
     #     debugpy.listen(("0.0.0.0", port))
-    #     print(f"Waiting for debugger attach on rank {os.environ['LOCAL_RANK']} (port {port})...")
+    #     print(f"Waiting for debugger attach on rank {os.environ['LOCAL_RwANK']} (port {port})...")
     #     debugpy.wait_for_client()
 
     if args.minfer_type == MInferType.BASELINE:
@@ -303,9 +342,10 @@ def main(args):
     model_args = {
         'model_id': args.model_id,
         'config_path': args.model_config_path,
-        'selected_layers': args.selected_layers,
     }
-    if args.minfer_type != 'baseline': model_args['minfer_config'] = minfer_config
+    if args.minfer_type != 'baseline': 
+        model_args['minfer_config'] = minfer_config
+
     model_config = ModelConfig(
         type=MInferModel if args.minfer_type != 'baseline' else BaselineModel,
         args=model_args,
@@ -433,7 +473,7 @@ def print_args(args: argparse.Namespace):
         print(f"Checkpoint Save Every {args.ckpt_n_step} Steps")
     else:
         print(f"Checkpoint Save Every {args.ckpt_n_epoch} Epochs")
-    print("=" * 80)
+    print("=" * 80, flush=True)
 
 if __name__ == '__main__':
     ## Parse Args ##
@@ -468,9 +508,6 @@ if __name__ == '__main__':
 
     parser.add_argument('-p', '--disable_progressbar',action='store_true',help='transformers model id',)
 
-    # add selected layers as the argument
-    parser.add_argument('--selected_layers', type=str, default='[]', help='selected layers')
-
     args = parser.parse_args()
     print_args(args)
 
@@ -482,6 +519,5 @@ if __name__ == '__main__':
 
     if args.minfer_config_name is None or args.minfer_config_name.lower() == 'none': args.minfer_config_name = None
 
-    args.selected_layers = eval(args.selected_layers)
     main(args)
 
