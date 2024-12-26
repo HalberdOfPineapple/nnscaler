@@ -725,12 +725,15 @@ class IRDimops(IRFwOperation):
             for odim in range(shape_anno.ndims):
                 accum = 1
                 for identifier in shape_anno[odim].identifiers:
+                    # print(f'=> identifier: {identifier} len: {self.anno.getlen(identifier)}')
                     accum *= self.anno.getlen(identifier)
                 shape.append(accum)
             otensor.shape = shape
+
         # print(f'=> sign: {self.signature} anno: {self.anno}\n'
         #       f'=> inputs: {self.inputs()}\n'
         #       f'=> outputs: {self.outputs()}')
+
         return True
 
     def new(self, inputs: List[IRTensor], outputs: List[IRTensor], **kwargs):
