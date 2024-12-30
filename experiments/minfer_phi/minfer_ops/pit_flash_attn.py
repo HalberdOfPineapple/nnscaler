@@ -8,8 +8,6 @@ import triton.language as tl
 from nnscaler.graph.parser.register import register_op
 from flash_attn.flash_attn_interface import _flash_attn_backward
 
-LN2_REC = 1.44269504
-
 # @triton.autotune(
 #    configs=[
 #        triton.Config({}, num_stages=1, num_warps=4),
@@ -320,7 +318,7 @@ def _triton_mixed_sparse_attn_fwd_kernel(
     # 2^x instead of exp in the loop because CSE and LICM
     # don't work as expected with `exp` in the loop
     # 1/ln2 = lne/ln2 = log2(e) => 2^(x / ln2) = 2^(x * log2(e)) = (2^(log2(e)))^x = e^x
-    qk_scale = sm_scale * LN2_REC
+    qk_scale = sm_scale * 1.44269504
 
     # load q: it will stay in SRAM throughout
     q = tl.load(q_ptrs)

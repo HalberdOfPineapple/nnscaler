@@ -5,6 +5,7 @@
 # 1. register the flash attention function to nnscaler and update related code
 # 2. replace the un-fused RMSNorm with apex's fused version
 import os
+import math
 import json
 import torch
 import logging
@@ -21,7 +22,7 @@ from transformers.utils import logging
 from nnscaler.graph.parser.register import register_op
 from nnscaler.ir import IRTensor
 
-from minfer_ops import vs_attn_forward
+from minfer_ops import vs_attn_forward, gen_block_indices
 from phi3 import Phi3Attention, apply_rotary_pos_emb, repeat_kv
 from modeling_modifier import nnscaler_flash_attention_forward
 from custom_trainer import get_iter_cnt
@@ -263,10 +264,10 @@ def attn_fwd_by_heads(
     layer_idx: int,
     pattern_dict: Dict[int, Tuple[str, int, int, int]],
     sparse_head_list: Optional[List[int]] = None,
-    # pattern: Tuple[str, int, int, int],
+    adaptive_sparse: bool = False,
 ):
     if sparse_head_list is None: 
-        sparse_head_list = [True] * query_states.size(1)
+        sparse_head_list = [True] * len(pattern_dict)
 
     with torch.autograd.set_detect_anomaly(True):
         assert(query_states.shape[1] == head_indices.shape[-1])
@@ -277,14 +278,20 @@ def attn_fwd_by_heads(
             q = query_states[:, head, :, :].unsqueeze(1) # (bsz, 1, q_len, head_dim)
             k = key_states[:, head, :, :].unsqueeze(1)
             v = value_states[:, head, :, :].unsqueeze(1)
+            pattern = pattern_dict.get(head_idx, ("vertical_and_slash", 100, 6096, 1))
+
+            # if adaptive_sparse is disabled, the sparse totally depends on the sparse_head_lsit and mark adaptive_activated as True
+            # adaptive_activated = True if not adaptive_sparse else attn_recall_activated(
+            #     q, k, v, q_len, head_dim,
+            #     pattern
+            # )
+            adaptive_activated = True
 
             # if search is disabled and the current layer is beyond  starting layer 
             # => apply the kernel for calculating the attention based on the best pattern
-            if sparse_head_list[head_idx]:
-                pattern = pattern_dict.get(head_idx, ("vertical_and_slash", 100, 6096, 1))
+            if sparse_head_list[head_idx] and adaptive_activated:
                 ty, vertical_size, slash_size, _ = pattern
 
-                # print(f"Layer {layer_idx} | Head {head_indices[head].item()} | Pattern {pattern}", flush=True)
                 try:
                     attn_output_head = vs_attn_forward(
                         q, k, v,
@@ -297,7 +304,7 @@ def attn_fwd_by_heads(
                     import traceback
                     traceback.print_exc()
  
-                    attn_output_head = torch.randn(bsz, 1, q_len, head_dim, device=query_states.device)
+                    attn_output_head = torch.randn(bsz, q_len, 1, head_dim, device=query_states.device)
             else:
                 # print(f"Layer {layer_idx} | Head {head_indices[head].item()} | Sparsity disabled", flush=True)
                 attn_output_head = flash_attn_func(
@@ -309,6 +316,86 @@ def attn_fwd_by_heads(
             output_list.append(attn_output_head)
         output = torch.cat(output_list, dim=2)
     return output
+
+
+
+# LAST_Q = 128
+# ATTN_RECALL_THRESHOLD = 0.8
+# def build_sparse_mask(
+#     block_count: torch.Tensor, # [BATCH, N_HEADS, NUM_ROWS], note that NUM_ROWS means the number of 64-sized rows
+#     block_offset, # [BATCH, N_HEADS, NUM_ROWS, NNZ_S], which refers to the start of the non-sparse K/V blocks to be computed with the corresponding Q block
+#     column_count, # [BATCH, N_HEADS, NUM_ROWS]
+#     column_index, # [BATCH, N_HEADS, NUM_ROWS, NNZ_V]
+#     bsz: int,
+#     q_len: int,
+#     block_size_M: int = 64,
+#     block_size_N: int = 64,
+# ):
+#     attn_mask = torch.zeros((bsz, LAST_Q, q_len))
+#     row_offset = (q_len - LAST_Q) // block_size_M
+#     num_row_blocks = LAST_Q // block_size_M
+
+#     for batch_idx in range(bsz):
+#         for row_idx in range(row_offset, row_offset + num_row_blocks):
+#             block_cnt = block_count[batch_idx, 0, row_idx]
+#             block_off = block_offset[batch_idx, 0, row_idx]
+#             col_cnt = column_count[batch_idx, 0, row_idx]
+#             col_idx = column_index[batch_idx, 0, row_idx]
+
+#             row_start = row_idx * block_size_M - (q_len - LAST_Q)
+#             row_end = min(LAST_Q, row_start + block_size_M)
+
+#             for i in range(block_cnt):
+#                 curr_block_start = block_off[i]
+#                 curr_block_end = min(q_len, curr_block_start + block_size_N)
+
+#                 attn_mask[batch_idx, row_start:row_end, curr_block_start:curr_block_end] = \
+#                     torch.ones((row_end - row_start, curr_block_end - curr_block_start))
+
+#             for j in range(col_cnt):
+#                 col_index = col_idx[j]
+#                 # attn_mask[batch_idx, row_start:row_end, col_index] = 1
+#                 attn_mask[batch_idx, row_start:row_end, col_index] = \
+#                     torch.ones((row_end - row_start))
+#     return attn_mask
+
+# def attn_recall_activated(
+#         query_states: torch.Tensor,
+#         key_states: torch.Tensor,
+#         value_states: torch.Tensor,
+#         bsz: int,
+#         q_len: int,
+#         head_dim: int,
+#         pattern: Tuple[str, int, int, int],
+# ):
+#     ty, vertical_size, slash_size, _ = pattern
+
+#     block_count, block_offset, column_count, column_index, _ = gen_block_indices(
+#         query_states, 
+#         key_states,
+#         value_states,
+#         q_len, vertical_size, slash_size, head_dim,
+#         block_size_M=64, block_size_N=64
+#     )
+#     sparse_mask = build_sparse_mask(
+#         block_count, block_offset, column_count, column_index,
+#         bsz, q_len
+#     ).view(bsz, 1, LAST_Q, q_len)
+
+#     causal_mask = torch.arange(q_len - LAST_Q, q_len, device=query_states.device)[:, None] >= torch.arange(q_len, device=query_states.device)[None, :]
+#     qk = torch.einsum(
+#         f'bhmk, bhnk -> bhmn', 
+#         query_states[:, :, -LAST_Q:, :].contiguous().to(query_states.device), # [BATCH, N_HEADS, LAST_Q, D_HEAD]
+#         key_states.to(query_states.device), # [BATCH, N_HEADS, N_CTX, D_HEAD]
+#     ) / math.sqrt(head_dim) # [BATCH, N_HEADS, LAST_Q, N_CTX]
+#     qk = torch.where(causal_mask, qk, float('-inf'))
+#     attn = F.softmax(qk, dim=-1)
+
+#     sparse_attn = torch.where(sparse_mask, attn, 0) # [BATCH, 1, LAST_Q, N_CTX]
+#     avg_attn_recall = torch.mean(torch.sum(sparse_attn, dim=-1), dim=-1)[0] # [BATCH, 1]
+#     return avg_attn_recall > ATTN_RECALL_THRESHOLD
+
+
 
 def minfer_attn_anno(query_states, key_states, value_states, *args, **kwargs) -> str:
     if query_states.shape[1] != key_states.shape[1]:

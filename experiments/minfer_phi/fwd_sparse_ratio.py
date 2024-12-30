@@ -1,4 +1,5 @@
 import os
+import sys
 import yaml
 import json
 import time
@@ -994,7 +995,6 @@ if __name__ == '__main__':
 
     # ------------------------------------------------------------------
     # Set log file
-    import sys
     if args.peek_attn:
         log_file_name = 'attn_peek.log'
     elif args.peek_attn_recall:

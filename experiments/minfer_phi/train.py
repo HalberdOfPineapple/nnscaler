@@ -47,6 +47,7 @@ class MInferType:
     MF_DB: str = "mf_db"
     DF_MB: str = "df_mb"
     MF_MB: str = "mf_mb"
+    FLEX_PREFILL: str = "flex_prefill"
 
 
 def nnscaler_phi_init(attn_type: str='flash', attn_save_path: str=None):
@@ -60,6 +61,12 @@ def minfer_phi_init():
     from minfer_modifier_v2 import MInferAttention
 
     PHI3_ATTENTION_CLASSES["flash_attention_2"] = MInferAttention
+
+def flexprefill_phi_init():
+    from phi3 import PHI3_ATTENTION_CLASSES
+    from flex_prefill_modifier import FlexPrefillAttention
+
+    PHI3_ATTENTION_CLASSES["flash_attention_2"] = FlexPrefillAttention
 
 def get_tokenizer(tokenizer_name_or_path,
                   model_max_length=None,
@@ -257,10 +264,13 @@ def main(args):
     #     debugpy.wait_for_client()
 
     if args.minfer_type == MInferType.BASELINE:
-        print(f"{__name__} | (Expr 0) Using Baseline Model...")
+        print(f"{__name__} | Using Baseline Model...")
         nnscaler_phi_init()
+    elif args.minfer_type == MInferType.FLEX_PREFILL:
+        print(f"{__name__} | Using FlexPrefill-equipped Model ...")
+        flexprefill_phi_init
     else:
-        print(f"{__name__} | (Expr 3) Using MInference-equipped Model ...")
+        print(f"{__name__} | Using MInference-equipped Model ...")
         minfer_phi_init()
 
     minfer_config_path = os.path.join(MINFER_CONFIG_DIR, f'{args.minfer_config_name}.yaml')
