@@ -487,7 +487,6 @@ if __name__ == '__main__':
         print(f"Using Baseline model for validation...")
         PHI_ATTENTION_CLASSES['flash_attention_2'] = NNScalerPhiFlashAttention2
 
-
         model_args = {
             "model_id": model_id,
         }
