@@ -148,13 +148,8 @@ def copy_config_files(args):
         "checkpoints", f"{args.epoch_idx:04d}-{args.iter_idx:04d}",
     )
     sync_ckpt_path = os.path.join(sync_dir, 'merged', "pytorch_model.bin")
-    sync_pattern_path = os.path.join(sync_dir, 'eval', "sparse_pattern.json")
     if not os.path.exists(sync_ckpt_path):
         raise ValueError(f"Merged checkpoint path {sync_ckpt_path} does not exist on Azure storage. Run merge_ckpt first.")
-
-    if os.path.exists(sync_pattern_path) and not args.override:
-        print(f"Pattern file {sync_pattern_path} already exists on Azure storage. Use -o to override.")
-        return True
 
     local_dir = os.path.join(
         '/scratch/eval', args.gpu_set, args.expr_dir, args.expr_name, "checkpoints",
@@ -407,6 +402,8 @@ def print_args(args):
     print(f"Iteration: {args.iter_idx}")
     print(f"Use Pretrained Checkpoint: {args.original}")
     print(f"Debug: {args.debug}")
+    print(f"Override: {args.override}")
+    print(f"Forced Baseline: {args.force_base}")
     print('-' * 30)
     print(f"Number of Global Batches: {NUM_GLOBAL_BATCHES}")
     print(f"Global Batch Size: {GLOBAL_BATCH_SIZE}")
@@ -426,6 +423,7 @@ if __name__ == '__main__':
     parser.add_argument("-o", "--override", action="store_true")
     parser.add_argument("--model_id", type=str, default="microsoft/Phi-3-mini-4k-instruct")
     parser.add_argument('--minfer_config', type=str, default="Phi-3-mini-4k-instruct-LongRoPE-128k")
+    parser.add_argument("--force_base", action="store_true")
     args = parser.parse_args()
 
     torch.cuda.empty_cache()
@@ -483,7 +481,7 @@ if __name__ == '__main__':
     # ------------------------------------------------------------------
     # Replace the Attention module 
     print('-' * 60)
-    if 'mfmb' not in args.expr_name and 'mf_mb' not in args.expr_name:
+    if ('mfmb' not in args.expr_name and 'mf_mb' not in args.expr_name) or args.force_base:
         print(f"Using Baseline model for validation...")
         PHI_ATTENTION_CLASSES['flash_attention_2'] = NNScalerPhiFlashAttention2
 
@@ -492,15 +490,10 @@ if __name__ == '__main__':
         }
         if args.original:
             model_args['config_path'] = f"{os.getenv('NNSCALER_HOME')}/experiments/minfer_phi/phi3/lc_config"
-        if args.peek_attn_recall:
-            model_args['peek_attn_recall'] = True
-            model_args['minfer_config_path'] = f"/scratch/nnscaler/experiments/minfer_phi/minfer_modules/configs/{args.minfer_config}.json"
-
         model = BaselineModel(**model_args)
     else:
         print(f"Using MInfer model for validation...")
         PHI_ATTENTION_CLASSES['flash_attention_2'] = MInferAttention
-
 
         if 'mcontrol' in args.expr_name:
             minfer_config_path = os.path.join(MINFER_CONFIG_DIR, f'mfmb_4k_base_iter_10.yaml')
@@ -545,7 +538,10 @@ if __name__ == '__main__':
     # Start Iteration
     iter_for_val(
         args, data_iter, model, 
-        log_file_path.replace('validation.log', 'val_losses.npy')
+        log_file_path.replace(
+            'validation.log', 
+            'val_losses.npy' if not args.force_base else 'val_losses_base.npy'
+        )
     )
 
     if not log_file_path.startswith('/scratch/sync/nnscaler_store'):

@@ -856,12 +856,12 @@ def torch_bhn_sumpool(x: torch.Tensor, kernel_size: int):
         value=0,
     )
     x = x.view(b, h, -1, kernel_size).sum(-1)
-    return x
+    return x # [b, h, n // kernel_size]
 
 
 def score_cover_topk(x: torch.Tensor, score: float):
-    cumsum_x = torch.cumsum(torch.sort(x, dim=-1, descending=True).values, dim=-1)
-    topk = torch.sum(cumsum_x <= score, dim=-1) + 1
+    cumsum_x = torch.cumsum(torch.sort(x, dim=-1, descending=True).values, dim=-1) # [batch_size, num_heads, seq_len]
+    topk = torch.sum(cumsum_x <= score, dim=-1) + 1 # [batch_size, num_heads], each element is the number of vertical/slash lines with attention scores summing up to score in this head 
     return topk
 
 
@@ -879,7 +879,7 @@ def sum_all_diagonal_matrix(mat: torch.tensor):
         (b, h, m, n), (h * n * (n + m - 1), n * (n + m - 1), 1, n + m)
     )
     sum_diags = torch.sum(mat_strided, -1)
-    return sum_diags
+    return sum_diags # 
 
 
 def transform_veritcal_slash_idx(v_idx, s_idx, num_blocks):
@@ -947,7 +947,7 @@ def get_active_blocks(
     gqa_groups = num_heads // k.shape[2]
     num_blocks = math.ceil(seq_len / block_size)
     max_budget = min(max_budget, num_blocks)
-    # last qk attention, qk shape: [batch_size, num_heads, block_size, seq_len]
+    # last qk attention, qk shape: [batch_size, num_heads_group, num_groups, last_q_len, seq_len]
     last_q = q[:, -block_size:, :, :] / math.sqrt(head_dim)
     if not gqa_interleave:
         qk = torch.einsum(
@@ -961,6 +961,7 @@ def get_active_blocks(
             last_q.view(last_q.shape[0], last_q.shape[1], gqa_groups, -1, head_dim),
             k.view(k.shape[0], k.shape[1], 1, -1, head_dim),
         )
+
     global causal_mask
     if causal_mask is None:
         causal_mask = torch.arange(0, block_size, device=last_q.device)
@@ -971,35 +972,45 @@ def get_active_blocks(
     )
     # softmax
     qk = torch.nn.functional.softmax(qk, dim=-1, dtype=torch.float32)
-    qk = rearrange(qk, "b h g i j -> b (h g) i j")
-    slash = sum_all_diagonal_matrix(qk) / qk.shape[-2]
-    vertical = qk.mean(-2)
+    qk = rearrange(qk, "b h g i j -> b (h g) i j") # [batch_size, num_heads, last_q_len, seq_len]
+
+
+    slash = sum_all_diagonal_matrix(qk) / qk.shape[-2] # [batch_size, num_heads, seq_len]
+    vertical = qk.mean(-2) # [batch_size, num_heads, seq_len]
+
     # get vertical slash size to make sure attention score >= gamma. shape: [batch_size, num_heads]
     num_vertical_blocks = score_cover_topk(vertical, gamma) // 128 + 1
     num_slash_blocks = score_cover_topk(slash, gamma) // 128 + 1
+
+    # Cap the number of blocks to be computed by predefined max and min budget 
     num_vertical_blocks[num_vertical_blocks < min_budget] = min_budget
     num_vertical_blocks[num_vertical_blocks > max_budget] = max_budget
     num_slash_blocks[num_slash_blocks < min_budget] = min_budget
     num_slash_blocks[num_slash_blocks > max_budget] = max_budget
+
     # block avg pool
-    vertical = torch_bhn_sumpool(vertical, block_size)
-    slash = torch_bhn_sumpool(slash, block_size)
+    vertical = torch_bhn_sumpool(vertical, block_size) # [batch_size, num_heads, num_blocks] with each element is the sum attention score of the vertical lines in this block
+    slash = torch_bhn_sumpool(slash, block_size) # [batch_size, num_heads, num_blocks] with each element is the sum attention score of the slash lines in this block
+
     # get block sparse mask
     if not gqa_interleave:
         avg_k = triton_bnhd_pool(k, block_size).repeat_interleave(gqa_groups, 2)
     else:
         avg_k = triton_bnhd_pool(k, block_size).repeat(1, 1, gqa_groups, 1)
+
     avg_qk = torch.einsum(
         "bihd, bjhd -> bhij", last_q.mean(1, keepdim=True), avg_k
     ).squeeze(2)
-    avg_qk = torch.softmax(avg_qk, dim=-1, dtype=torch.float32)
-    kl_div = square_root_js_divergence(avg_qk, vertical)
+    avg_qk = torch.softmax(avg_qk, dim=-1, dtype=torch.float32) # [batch_size, num_heads, last_q_len, seq_len]
+    kl_div = square_root_js_divergence(avg_qk, vertical) # [batch_size, num_heads]
     block_sparse_mask = kl_div < tau
     num_vertical_blocks[block_sparse_mask] = min_budget
     num_slash_blocks[block_sparse_mask] = min_budget
+
     # keep first vertical and slash block
     vertical[..., :1] = torch.inf
     slash[..., -1:] = torch.inf
+
     # get slash topk
     num_slash_blocks = num_slash_blocks.view(batch_size * num_heads)
     slash = slash.view(batch_size * num_heads, -1)
@@ -1011,6 +1022,7 @@ def get_active_blocks(
         >= num_slash_blocks[:, None]
     ] = 0
     slash_topk = slash_topk.view(batch_size, num_heads, -1)
+
     # get vertical topk
     num_vertical_blocks = num_vertical_blocks.view(batch_size * num_heads)
     vertical = vertical.view(batch_size * num_heads, -1)
@@ -1024,8 +1036,10 @@ def get_active_blocks(
         >= num_vertical_blocks[:, None]
     ] = 0
     vertical_topk = vertical_topk.view(batch_size, num_heads, -1)
+
     # transform vertical slash index
     block_idx = transform_veritcal_slash_idx(vertical_topk, slash_topk, num_blocks)
+
     # get block sparse topk
     block_causal_mask = None
     for b, h in block_sparse_mask.nonzero():
@@ -1046,6 +1060,7 @@ def get_active_blocks(
         attn = torch.softmax(attn, dim=-1, dtype=torch.float32).view(-1)
         block_topk = score_cover_idx(attn, gamma * num_blocks)
         block_idx[b][h] = torch.unique(torch.cat((block_idx[b][h], block_topk), dim=-1))
+
     return block_idx
 
 
