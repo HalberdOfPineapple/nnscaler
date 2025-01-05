@@ -87,7 +87,6 @@ def get_vs_indices(
 def flex_gen_block_indices(
     q: torch.Tensor, # [BATCH, N_CTX, N_HEADS, D_HEAD]
     k: torch.Tensor, # [BATCH, N_CTX, N_HEADS, D_HEAD]
-    v: torch.Tensor, # [BATCH, N_CTX, N_HEADS, D_HEAD]
     gamma: float,
     min_budget: int,
     max_budget: int,
@@ -97,7 +96,6 @@ def flex_gen_block_indices(
 ):
     batch_size, seq_len, num_heads, head_dim = q.shape
     gqa_groups = num_heads // k.shape[2]
-    num_blocks = math.ceil(seq_len / block_size_M)
 
     # last qk attention, qk shape: [batch_size, num_heads_group, num_groups, last_q_len, seq_len]
     last_q = q[:, -block_size_M:, :, :] / math.sqrt(head_dim)
@@ -133,13 +131,13 @@ def flex_gen_block_indices(
     vertical_cumsum = torch.cumsum(vertical_sorted.values, dim=-1) # [batch_size, num_heads, seq_len]
     num_topk_vertical = torch.sum(vertical_cumsum <= gamma, dim=-1) + 1 # [batch_size, num_heads]
     num_topk_vertical = torch.clamp(num_topk_vertical, min=min_budget, max=max_budget)
-    print(f"num_topk_vertical ({num_topk_vertical.shape}) {num_topk_vertical}")
+    # print(f"num_topk_vertical ({num_topk_vertical.shape}) {num_topk_vertical}")
 
     max_vertical_size = num_topk_vertical.max().item()
-    print(f"max_vertical_size {max_vertical_size}")
+    # print(f"max_vertical_size {max_vertical_size}")
 
     vertical_topk = torch.topk(vertical, max_vertical_size, -1).indices # [BATCH, N_HEADS, VERTICAL_SIZE]
-    print(f"vertical_topk ({vertical_topk.shape}) {vertical_topk}")
+    # print(f"vertical_topk ({vertical_topk.shape}) {vertical_topk}")
 
 
     # slash[..., -block_size_M:] = torch.inf
@@ -147,17 +145,17 @@ def flex_gen_block_indices(
     slash_cumsum = torch.cumsum(slash_sorted.values, dim=-1) # [batch_size, num_heads, seq_len]
     num_topk_slash = torch.sum(slash_cumsum <= gamma, dim=-1) + 1 # [batch_size, num_heads]
     num_topk_slash = torch.clamp(num_topk_slash, min=min_budget, max=max_budget)
-    print(f"num_topk_slash ({num_topk_slash.shape}) {num_topk_slash}")
+    # print(f"num_topk_slash ({num_topk_slash.shape}) {num_topk_slash}")
 
     max_slash_size = num_topk_slash.max().item()
     slash_topk = torch.topk(slash, max_slash_size, -1).indices # [BATCH, N_HEADS, SLASH_SIZE]
     slash_topk = (seq_len - 1) - slash_topk
-    print(f"slash_topk ({slash_topk.shape}) {slash_topk}")
+    # print(f"slash_topk ({slash_topk.shape}) {slash_topk}")
 
     v_idx = vertical_topk.to(torch.int32).reshape((batch_size, num_heads, -1)).sort(dim=-1, descending=False)[0]
     s_idx = slash_topk.to(torch.int32).reshape((batch_size, num_heads, -1)).sort(dim=-1, descending=True)[0]
-    print(f"v_idx ({v_idx.shape}) {v_idx}")
-    print(f"s_idx ({s_idx.shape}) {s_idx}")
+    # print(f"v_idx ({v_idx.shape}) {v_idx}")
+    # print(f"s_idx ({s_idx.shape}) {s_idx}")
 
     return v_idx, s_idx
 
@@ -179,7 +177,6 @@ def gen_block_indices(
         v_idx, s_idx = flex_gen_block_indices(
             q.transpose(1, 2), 
             k.transpose(1, 2),
-            v.transpose(1, 2),
             gamma, min_budget, max_budget, False, 
             block_size_M, block_size_N
         )
@@ -525,9 +522,9 @@ def _triton_mixed_sparse_attn_fwd_kernel(
     tl.store(softmax_lse_ptr, softmax_lse_vals.to(dtype)[:, None], mask=m_mask) 
 
 def _triton_mixed_sparse_attention(
-    q: torch.Tensor,          # [BATCH, N_CTX, N_HEADS, D_HEAD]
-    k: torch.Tensor,          # [BATCH, N_CTX, N_HEADS, D_HEAD]
-    v: torch.Tensor,          # [BATCH, N_CTX, N_HEADS, D_HEAD]
+    q: torch.Tensor,          # [BATCH, N_HEADS, N_CTX, D_HEAD]
+    k: torch.Tensor,          # [BATCH, N_HEADS, N_CTX, D_HEAD]
+    v: torch.Tensor,          # [BATCH, N_HEADS, N_CTX, D_HEAD]
     seqlens: torch.Tensor,    # [BATCH, ]
     block_count: torch.Tensor,  # [BATCH, N_HEADS, cdiv(N_CTX, BLOCK_SIZE_M)]
     block_offset: torch.Tensor,  # [BATCH, N_HEADS, cdiv(N_CTX, BLOCK_SIZE_M), NNZ_S]
@@ -545,12 +542,12 @@ def _triton_mixed_sparse_attention(
     assert Lk in {16, 32, 64, 128}
     o = torch.zeros_like(q)
     
-    grid = (triton.cdiv(q.shape[1], block_size_M), q.shape[0] * q.shape[1], 1)
+    grid = (triton.cdiv(q.shape[2], block_size_M), q.shape[0] * q.shape[1], 1)
     dtype = tl.bfloat16 if q.dtype == torch.bfloat16 else tl.float16
 
     # auto softmax_lse = torch::empty({batch_size, num_heads, seqlen_q}, opts.dtype(at::kFloat));
     softmax_lse = torch.zeros(
-        (q.shape[0], q.shape[2], q.shape[1], ), 
+        (q.shape[0], q.shape[1], q.shape[2]), 
         dtype=torch.float32, # Note that the dtype must be float32 instead of float16
         device=q.device
     )
@@ -637,6 +634,7 @@ class VSSAttention(torch.autograd.Function):
             block_count, block_offset, column_count, column_index
         ) = ctx.saved_tensors
         do = pad_tensor(do, context_size, head_dim, block_size_M).contiguous()
+
         dq, dk, dv = (
             torch.zeros_like(q).to(torch.float32), 
             torch.zeros_like(k).to(torch.float32), 
@@ -707,10 +705,10 @@ def flex_attn_forward(
         gamma, min_budget, max_budget,
         block_size_M, block_size_N,
     )
-    print(f"block_count: {block_count}")
-    print(f"block_offset: {block_offset}")
-    print(f"column_count: {column_count}")
-    print(f"column_index: {column_index}")
+    # print(f"block_count: {block_count}")
+    # print(f"block_offset: {block_offset}")
+    # print(f"column_count: {column_count}")
+    # print(f"column_index: {column_index}")
 
     return VSSAttention.apply(
         q, k, v, 
@@ -732,6 +730,9 @@ def test_dense_pattern():
     q = torch.randn((1, num_heads, context_size, head_dim), dtype=torch.bfloat16, device='cuda', requires_grad=True)
     k = torch.randn((1, num_heads, context_size, head_dim), dtype=torch.bfloat16, device='cuda', requires_grad=True)
     v = torch.randn((1, num_heads, context_size, head_dim), dtype=torch.bfloat16, device='cuda', requires_grad=True)
+    # q = torch.ones((1, num_heads, context_size, head_dim), dtype=torch.bfloat16, device='cuda', requires_grad=True)
+    # k = torch.ones((1, num_heads, context_size, head_dim), dtype=torch.bfloat16, device='cuda', requires_grad=True)
+    # v = torch.ones((1, num_heads, context_size, head_dim), dtype=torch.bfloat16, device='cuda', requires_grad=True)
 
     o: torch.Tensor = flex_attn_forward(
         q, k, v, 
@@ -741,6 +742,11 @@ def test_dense_pattern():
         max_budget=max_budget,
     )
     print(f"o shape: {o.shape}")
+
+    # # count how many zeros in o
+    # num_ones = torch.sum(o).cpu().item()
+    # print(f"number of ones in output: {num_ones}")
+
 
     q.retain_grad()
     k.retain_grad()
@@ -774,6 +780,9 @@ def test_dense_pattern():
         causal=True,
     ).transpose(1, 2)
     o_ref.retain_grad()
+
+    # num_ones_ref = torch.sum(o_ref).cpu().item()
+    # print(f"number of ones in output (ref): {num_ones_ref}")
 
     print(f"o_ref shape: {o_ref.shape}")
     torch.cuda.synchronize()

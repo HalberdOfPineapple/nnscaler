@@ -44,8 +44,6 @@ SPARSE_HEAD_MAP_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), '
 # define a enumerate class for MInfer type
 class MInferType:
     BASELINE: str = "baseline"
-    MF_DB: str = "mf_db"
-    DF_MB: str = "df_mb"
     MF_MB: str = "mf_mb"
     FLEX_PREFILL: str = "flex_prefill"
 
@@ -132,6 +130,28 @@ def minfer_patch_setup(model, minfer_config: MInferenceConfig):
             f"The attention type {minfer_config.attn_type} is currently not supported for training"
         )
     return model
+
+def aggregate_outputs_fn(loss_outputs, sync_group) -> AggregatedOutputs:
+    losses, ntokens_info = [], []
+    for _, loss, ntokens, _ in loss_outputs:
+        losses.append(loss)
+        ntokens_info.append(ntokens)
+
+    loss_sum = torch.sum(torch.stack(losses), dtype=torch.float64)
+    torch.distributed.all_reduce(loss_sum, group=sync_group)
+
+    ntokens_sum = torch.sum(torch.tensor(ntokens_info, dtype=torch.float64, device=torch.cuda.current_device()))
+    torch.distributed.all_reduce(ntokens_sum, group=sync_group)
+    
+    num_batches = torch.tensor(len(losses), device=torch.cuda.current_device())
+    torch.distributed.all_reduce(num_batches, group=sync_group)
+
+    return AggregatedOutputs(
+        loss_sum=loss_sum.item() / ntokens_sum.item(),
+        num_batches=num_batches.item(),
+        num_tokens=ntokens_sum.item(),
+    )
+
 
 class BaselineModel(torch.nn.Module):
     def __init__(self, model_id, config_path: str=None):
@@ -231,26 +251,29 @@ class MInferModel(BaselineModel):
                 )
         self.model.apply(update_module)
 
-def aggregate_outputs_fn(loss_outputs, sync_group) -> AggregatedOutputs:
-    losses, ntokens_info = [], []
-    for _, loss, ntokens, _ in loss_outputs:
-        losses.append(loss)
-        ntokens_info.append(ntokens)
+class FlexPrefillModel(BaselineModel):
+    def __init__(
+            self, 
+            model_id, 
+            config_path: str=None, 
+            attn_config: Dict={},
+    ):
+        super().__init__(
+            model_id=model_id,
+            config_path=config_path,
+        )
 
-    loss_sum = torch.sum(torch.stack(losses), dtype=torch.float64)
-    torch.distributed.all_reduce(loss_sum, group=sync_group)
+        Attention = self.model.model.layers[0].self_attn.__class__
+        def update_module(m):
+            if isinstance(m, Attention):
+                m.init_flex_prefill_parameters(attn_config)
+        self.model.apply(update_module)
 
-    ntokens_sum = torch.sum(torch.tensor(ntokens_info, dtype=torch.float64, device=torch.cuda.current_device()))
-    torch.distributed.all_reduce(ntokens_sum, group=sync_group)
-    
-    num_batches = torch.tensor(len(losses), device=torch.cuda.current_device())
-    torch.distributed.all_reduce(num_batches, group=sync_group)
-
-    return AggregatedOutputs(
-        loss_sum=loss_sum.item() / ntokens_sum.item(),
-        num_batches=num_batches.item(),
-        num_tokens=ntokens_sum.item(),
-    )
+minfer_to_model = {
+    MInferType.BASELINE: BaselineModel,
+    MInferType.FLEX_PREFILL: FlexPrefillModel,
+    MInferType.MF_MB: MInferModel,
+}
 
 
 def main(args):
@@ -268,7 +291,7 @@ def main(args):
         nnscaler_phi_init()
     elif args.minfer_type == MInferType.FLEX_PREFILL:
         print(f"{__name__} | Using FlexPrefill-equipped Model ...")
-        flexprefill_phi_init
+        flexprefill_phi_init()
     else:
         print(f"{__name__} | Using MInference-equipped Model ...")
         minfer_phi_init()
@@ -353,11 +376,13 @@ def main(args):
         'model_id': args.model_id,
         'config_path': args.model_config_path,
     }
-    if args.minfer_type != 'baseline': 
+    if args.minfer_type == 'mf_mb': 
         model_args['minfer_config'] = minfer_config
+    elif args.minfer_type == 'flex_prefill':
+        model_args['attn_config'] = minfer_config
 
     model_config = ModelConfig(
-        type=MInferModel if args.minfer_type != 'baseline' else BaselineModel,
+        type=minfer_to_model[args.minfer_type],
         args=model_args,
     )
 
