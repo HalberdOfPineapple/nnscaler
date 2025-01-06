@@ -171,7 +171,7 @@ class BaselineModel(torch.nn.Module):
                 config=model_config,
             )
             
-        print(f'{__name__} BaselineModel Selt-Attention Class: {self.model.model.layers[0].self_attn.__class__.__name__}')
+        print(f'{__name__} BaselineModel Self-Attention Class: {self.model.model.layers[0].self_attn.__class__.__name__}')
 
     def forward(self, samples):
         with torch.autocast(device_type="cuda", dtype=self.model.config.torch_dtype):

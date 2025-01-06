@@ -10,21 +10,9 @@ from minference.cuda import convert_vertical_slash_indexes
 from nnscaler.graph.parser.register import register_op
 from flash_attn.flash_attn_interface import _flash_attn_backward
 
-# @triton.autotune(
-#    configs=[
-#        triton.Config({}, num_stages=1, num_warps=4),
-#        triton.Config({}, num_stages=1, num_warps=8),
-#        triton.Config({}, num_stages=2, num_warps=4),
-#        triton.Config({}, num_stages=2, num_warps=8),
-#        triton.Config({}, num_stages=3, num_warps=4),
-#        triton.Config({}, num_stages=3, num_warps=8),
-#        triton.Config({}, num_stages=4, num_warps=4),
-#        triton.Config({}, num_stages=4, num_warps=8),
-#        triton.Config({}, num_stages=5, num_warps=4),
-#        triton.Config({}, num_stages=5, num_warps=8),
-#    ],
-#    key=['N_CTX'],
-# )
+VIRT_NUM_LAYERS = 200
+BLOCK_IDX_DICT = {}
+
 
 def sum_all_diagonal_matrix(mat: torch.tensor):
     b, h, n, m = mat.shape
@@ -83,7 +71,6 @@ def get_vs_indices(
     s_idx = slash_indices.to(torch.int32).reshape((batch_size, num_heads, -1)).sort(dim=-1, descending=True)[0]
     return v_idx, s_idx
 
-
 def flex_gen_block_indices(
     q: torch.Tensor, # [BATCH, N_CTX, N_HEADS, D_HEAD]
     k: torch.Tensor, # [BATCH, N_CTX, N_HEADS, D_HEAD]
@@ -108,8 +95,8 @@ def flex_gen_block_indices(
     else:
         qk = torch.einsum(
             "bihgd, bjhgd -> bhgij",
-            last_q.view(last_q.shape[0], last_q.shape[1], gqa_groups, -1, head_dim),
-            k.view(k.shape[0], k.shape[1], 1, -1, head_dim),
+            last_q.view(last_q.shape[0], last_q.shape[1], gqa_groups, -1, head_dim).to(torch.float32),
+            k.view(k.shape[0], k.shape[1], 1, -1, head_dim).to(torch.float32),
         )
     
     causal_mask = torch.arange(0, block_size_M, device=last_q.device)
@@ -134,10 +121,12 @@ def flex_gen_block_indices(
     # print(f"num_topk_vertical ({num_topk_vertical.shape}) {num_topk_vertical}")
 
     max_vertical_size = num_topk_vertical.max().item()
-    # print(f"max_vertical_size {max_vertical_size}")
+    # print('-' * 50)
+    # print(f"flex_gen_block_indices: max_vertical_size {max_vertical_size}")
 
     vertical_topk = torch.topk(vertical, max_vertical_size, -1).indices # [BATCH, N_HEADS, VERTICAL_SIZE]
     # print(f"vertical_topk ({vertical_topk.shape}) {vertical_topk}")
+    # print(f"vertical_topk values: {torch.topk(vertical, max_vertical_size, -1).values}")
 
 
     # slash[..., -block_size_M:] = torch.inf
@@ -150,13 +139,11 @@ def flex_gen_block_indices(
     max_slash_size = num_topk_slash.max().item()
     slash_topk = torch.topk(slash, max_slash_size, -1).indices # [BATCH, N_HEADS, SLASH_SIZE]
     slash_topk = (seq_len - 1) - slash_topk
-    # print(f"slash_topk ({slash_topk.shape}) {slash_topk}")
+    # print(f"flex_gen_block_indices: slash_topk ({slash_topk.shape}) {slash_topk}")
+    # print(f"slash_topk values: {torch.topk(slash, max_slash_size, -1).values}")
 
     v_idx = vertical_topk.to(torch.int32).reshape((batch_size, num_heads, -1)).sort(dim=-1, descending=False)[0]
     s_idx = slash_topk.to(torch.int32).reshape((batch_size, num_heads, -1)).sort(dim=-1, descending=True)[0]
-    # print(f"v_idx ({v_idx.shape}) {v_idx}")
-    # print(f"s_idx ({s_idx.shape}) {s_idx}")
-
     return v_idx, s_idx
 
 
@@ -173,7 +160,7 @@ def gen_block_indices(
 ):
     batch_size, num_heads, context_size, head_dim = q.shape
     with torch.no_grad():
-        # v_idx, s_idx = get_vs_indices(q, k, v, q_len, vertical_size, slash_size, head_dim, block_size_M, block_size_N)
+        # v_idx, s_idx = get_vs_indices(q, k, v, context_size, 100, 6096, head_dim, block_size_M, block_size_N)
         v_idx, s_idx = flex_gen_block_indices(
             q.transpose(1, 2), 
             k.transpose(1, 2),
@@ -678,6 +665,12 @@ class VSSAttention(torch.autograd.Function):
             num_stages=2,
         )
 
+        # ----------------------------------
+        global BLOCK_IDX_DICT
+        head_global_idx = layer_idx * VIRT_NUM_LAYERS + head_idx
+        BLOCK_IDX_DICT[head_global_idx] = None
+        # ----------------------------------
+
         return (
             dq[:, :, :context_size, :head_dim].to(q.dtype), 
             dk[:, :, :context_size, :head_dim].to(k.dtype), 
@@ -700,11 +693,25 @@ def flex_attn_forward(
     min_budget = 1 if min_budget is None else min_budget
     max_budget = q.shape[2] if max_budget is None else max_budget
 
-    block_count, block_offset, column_count, column_index, seqlens = gen_block_indices(
-        q, k, v, 
-        gamma, min_budget, max_budget,
-        block_size_M, block_size_N,
-    )
+    head_global_idx = layer_idx * VIRT_NUM_LAYERS + head_idx
+
+    global BLOCK_IDX_DICT
+    if BLOCK_IDX_DICT.get(head_global_idx, None) is None:
+        block_count, block_offset, column_count, column_index, seqlens = gen_block_indices(
+            q, k, v, 
+            gamma, min_budget, max_budget,
+            block_size_M, block_size_N,
+        )
+        BLOCK_IDX_DICT[head_global_idx] = (
+            block_count.cpu(), block_offset.cpu(), column_count.cpu(), column_index.cpu(), seqlens.cpu()
+        )
+    else:
+        block_count, block_offset, column_count, column_index, seqlens = BLOCK_IDX_DICT[head_global_idx]
+        block_count, block_offset, column_count, column_index, seqlens = (
+            block_count.to(q.device), block_offset.to(q.device), 
+            column_count.to(q.device), column_index.to(q.device),
+            seqlens.to(q.device)
+        )
     # print(f"block_count: {block_count}")
     # print(f"block_offset: {block_offset}")
     # print(f"column_count: {column_count}")
@@ -747,7 +754,6 @@ def test_dense_pattern():
     # num_ones = torch.sum(o).cpu().item()
     # print(f"number of ones in output: {num_ones}")
 
-
     q.retain_grad()
     k.retain_grad()
     v.retain_grad()
@@ -780,9 +786,6 @@ def test_dense_pattern():
         causal=True,
     ).transpose(1, 2)
     o_ref.retain_grad()
-
-    # num_ones_ref = torch.sum(o_ref).cpu().item()
-    # print(f"number of ones in output (ref): {num_ones_ref}")
 
     print(f"o_ref shape: {o_ref.shape}")
     torch.cuda.synchronize()
@@ -822,7 +825,7 @@ def test_dense_pattern():
             if not q_grad_close: print(f"Head {head_idx} q grad is not close")
             print(f"Q Grad:\n{q_grad[0, head_idx, :, :]}")
             print(f"Q Grad Ref:\n{q_ref_grad[0, head_idx, :, :]}")
-        
+
         if not k_grad_close: 
             print('-' * 20)
             if not k_grad_close: print(f"Head {head_idx} k grad is not close")

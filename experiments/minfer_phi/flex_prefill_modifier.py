@@ -143,7 +143,7 @@ class FlexPrefillAttention(Phi3Attention):
         key_states = repeat_kv(key_states, self.num_key_value_groups)
         value_states = repeat_kv(value_states, self.num_key_value_groups)
 
-        attn_dropout = self.attention_dropout if self.training else 0.0
+        # attn_dropout = self.attention_dropout if self.training else 0.0
 
         if query_states.dtype == torch.float32:
             if torch.is_autocast_enabled():
@@ -166,7 +166,7 @@ class FlexPrefillAttention(Phi3Attention):
 
         # -----------------------------
         head_indices = torch.arange(query_states.shape[1], device=query_states.device, dtype=torch.int32)
-        attn_output = attn_fwd_by_heads(
+        attn_output = flex_attn_fwd_by_heads(
             query_states, key_states, value_states, head_indices,
             bsz=bsz, q_len=q_len, head_dim=self.head_dim,
             gamma=self.gamma,
@@ -185,7 +185,7 @@ class FlexPrefillAttention(Phi3Attention):
         return attn_output, attn_weights, past_key_value
 
 
-def attn_fwd_by_heads(
+def flex_attn_fwd_by_heads(
     query_states: torch.Tensor,
     key_states: torch.Tensor,
     value_states: torch.Tensor,
@@ -246,7 +246,7 @@ def minfer_attn_anno(query_states, key_states, value_states, *args, **kwargs) ->
 
 if __name__ != "__main__":
     # register_op(minfer_attn_anno)(flex_attn_forward)
-    register_op(minfer_attn_anno)(attn_fwd_by_heads)
+    register_op(minfer_attn_anno)(flex_attn_fwd_by_heads)
 
 
 
@@ -265,7 +265,7 @@ def test_flex_prefill():
     k = torch.randn((1, num_heads, context_size, head_dim), dtype=torch.bfloat16, device='cuda', requires_grad=True)
     v = torch.randn((1, num_heads, context_size, head_dim), dtype=torch.bfloat16, device='cuda', requires_grad=True)
 
-    o: torch.Tensor = attn_fwd_by_heads(
+    o: torch.Tensor = flex_attn_fwd_by_heads(
         q, k, v, torch.arange(num_heads, device='cuda', dtype=torch.int32),
         bsz=1, q_len=context_size, head_dim=head_dim, layer_idx=0,
         gamma=gamma, min_budget=min_budget, max_budget=max_budget,
